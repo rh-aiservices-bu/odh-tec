@@ -5,8 +5,34 @@ const HtmlWebpackPlugin = require('html-webpack-plugin');
 const CopyPlugin = require('copy-webpack-plugin');
 const TsconfigPathsPlugin = require('tsconfig-paths-webpack-plugin');
 const Dotenv = require('dotenv-webpack');
+const MonacoWebpackPlugin = require('monaco-editor-webpack-plugin');
+
+// Load environment variables from backend/.env before webpack config evaluation
+// This ensures process.env.NB_PREFIX is available for webpack config logic
+require('dotenv').config({ path: path.resolve(__dirname, '../backend/.env') });
+
 const BG_IMAGES_DIRNAME = 'bgimages';
-const ASSET_PATH = process.env.ASSET_PATH || '/';
+
+/**
+ * Normalizes a path prefix to ensure it has a leading slash and a trailing slash.
+ * Returns '/' if input is empty or only slashes (for root deployment).
+ * Note: For publicPath, we need trailing slash for webpack asset loading.
+ */
+const normalizePublicPath = (prefix) => {
+  if (!prefix) return '/';
+
+  // Remove all leading and trailing slashes
+  const trimmed = prefix.replace(/^\/+|\/+$/g, '');
+
+  // If nothing left after trimming, return root
+  if (!trimmed) return '/';
+
+  // Add leading and trailing slash for publicPath
+  return `/${trimmed}/`;
+};
+
+// Use NB_PREFIX for path prefix (for Gateway API routing, etc.)
+const PUBLIC_PATH = normalizePublicPath(process.env.NB_PREFIX);
 module.exports = (env) => {
   return {
     module: {
@@ -76,14 +102,14 @@ module.exports = (env) => {
           include: [
             path.resolve(__dirname, 'src/app/assets/images'),
           ],
-          use: 
-            {
-              loader: 'file-loader',
-              options: {
-                name: '[path][name].[ext]',
-                outputPath: 'images',
-              }
-            },
+          use:
+          {
+            loader: 'file-loader',
+            options: {
+              name: '[path][name].[ext]',
+              outputPath: 'images',
+            }
+          },
         },
         {
           test: /\.(jpg|jpeg|png|gif)$/i,
@@ -123,18 +149,39 @@ module.exports = (env) => {
     output: {
       filename: '[name].bundle.js',
       path: path.resolve(__dirname, 'dist'),
-      publicPath: ASSET_PATH,
+      // In dev: use PUBLIC_PATH for webpack-dev-server
+      // In prod: use 'auto' to generate relative paths that work with <base> tag
+      publicPath: env === 'development' ? PUBLIC_PATH : 'auto',
     },
     plugins: [
       new HtmlWebpackPlugin({
         template: path.resolve(__dirname, 'src', 'index.html'),
+        // In dev: use PUBLIC_PATH for webpack-dev-server
+        // In prod: use empty string for backend runtime injection
+        publicPath: env === 'development' ? PUBLIC_PATH : '',
+        templateParameters: {
+          // In dev: inject NB_PREFIX at build time for webpack-dev-server
+          // In prod: empty for backend runtime injection
+          nbPrefix: env === 'development' ? process.env.NB_PREFIX || '' : '',
+        },
       }),
       new Dotenv({
+        path: path.resolve(__dirname, '../backend/.env'),
         systemvars: true,
         silent: true,
+        defaults: false,
       }),
       new CopyPlugin({
-        patterns: [{ from: './src/favicon.svg', to: 'images' },{ from: './public/locales', to: 'locales' }],
+        patterns: [{ from: './src/favicon.svg', to: 'images' }, { from: './public/locales', to: 'locales' }],
+      }),
+      new MonacoWebpackPlugin({
+        // Include commonly used languages for file preview
+        languages: ['javascript', 'typescript', 'json', 'python', 'yaml', 'css', 'html', 'markdown', 'shell', 'dockerfile', 'xml', 'sql'],
+        // Include all features for a complete editor experience
+        features: ['!gotoSymbol'],
+        // Output workers to monaco subdirectory for better organization
+        // Note: publicPath is omitted to inherit from main webpack config (PUBLIC_PATH)
+        filename: 'monaco/[name].worker.js',
       }),
     ],
     resolve: {

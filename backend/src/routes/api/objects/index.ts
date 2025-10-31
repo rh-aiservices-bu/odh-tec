@@ -9,28 +9,29 @@ import {
 import { Upload } from '@aws-sdk/lib-storage';
 import axios, { AxiosRequestConfig } from 'axios';
 import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { request as httpsRequest } from 'https';
+import { request as httpRequest } from 'http';
 import { HttpProxyAgent } from 'http-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import { Readable, Transform, pipeline } from 'stream';
+import { Readable, pipeline, PassThrough } from 'stream';
+import { URL } from 'url';
 import { promisify } from 'util';
 import { promises as fs, createWriteStream } from 'fs';
 import path from 'path';
-import {
-  getHFConfig,
-  getMaxConcurrentTransfers,
-  getProxyConfig,
-  getS3Config,
-} from '../../../utils/config';
+import { base64Decode } from '../../../utils/encoding';
+import { getHFConfig, getProxyConfig, getS3Config } from '../../../utils/config';
 import { logAccess } from '../../../utils/logAccess';
 import { validatePath, SecurityError } from '../../../utils/localStorage';
+import { logMemory } from '../../../utils/memoryProfiler';
 import { transferQueue, TransferFileJob } from '../../../utils/transferQueue';
+import { uploadWithCleanup, createProgressTransform } from '../../../utils/streamHelpers';
+import { sanitizeErrorForLogging } from '../../../utils/errorLogging';
 import {
   validateBucketName,
   validateContinuationToken,
   validateQuery,
   validateAndDecodePrefix,
 } from '../../../utils/validation';
-import pLimit from 'p-limit';
 import { authenticateUser } from '../../../plugins/auth';
 import { auditLog } from '../../../utils/auditLog';
 import { checkRateLimit, getRateLimitResetTime } from '../../../utils/rateLimit';
@@ -52,15 +53,6 @@ type Sibling = {
 };
 
 type Siblings = Sibling[];
-
-interface UploadError {
-  error: string;
-  message: string;
-}
-
-interface UploadErrors {
-  [key: string]: UploadError;
-}
 
 const createRef = (initialValue: any) => {
   return {
@@ -86,7 +78,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
       const params = request.params as any;
       const bucketName = params.bucketName || 'unknown';
       const encodedKey = params.encodedKey || '';
-      const resource = `s3:${bucketName}/${encodedKey ? atob(encodedKey) : ''}`;
+      const resource = `s3:${bucketName}/${encodedKey ? base64Decode(encodedKey) : ''}`;
       const status = reply.statusCode >= 200 && reply.statusCode < 300 ? 'success' : 'failure';
       const action = request.method.toLowerCase();
       auditLog(request.user, action, resource, status);
@@ -99,10 +91,6 @@ export default async (fastify: FastifyInstance): Promise<void> => {
 
   // 🔐 SECURITY: DoS Prevention - Reduced from 40 to 5
   const MAX_CONTAINS_SCAN_PAGES = 5; // CHANGED FROM 40
-
-  // Future enhancements (not yet implemented):
-  // - const MAX_OBJECTS_TO_EXAMINE = 2500;
-  // - const CONTAINS_SEARCH_TIMEOUT_MS = 10000;
 
   // 🔐 SECURITY: Rate limiting for expensive operations
   const RATE_LIMIT_CONTAINS_SEARCH = 5; // requests per minute
@@ -128,13 +116,6 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     };
   }
 
-  // Future enhancement: Generator pattern for memory efficiency
-  // interface ScanYieldItem {
-  //   type: 'object' | 'prefix';
-  //   data: any;
-  //   matchRanges?: [number, number][];
-  // }
-
   const normalizeMaxKeys = (raw?: any): number => {
     const n = parseInt(raw, 10);
     if (isNaN(n)) return DEFAULT_MAX_KEYS;
@@ -152,18 +133,6 @@ export default async (fastify: FastifyInstance): Promise<void> => {
   const buildResponse = (reply: FastifyReply, payload: EnhancedResult) => {
     reply.send(payload);
   };
-
-  // Future enhancement: Helper functions for generator pattern
-  // const extractLeafName = (keyOrPrefix: string): string => {
-  //   if (keyOrPrefix.endsWith('/')) {
-  //     return keyOrPrefix.slice(0, -1).split('/').pop() || keyOrPrefix;
-  //   }
-  //   return keyOrPrefix.split('/').pop() || keyOrPrefix;
-  // };
-
-  // const matchesQuery = (name: string, qLower: string): boolean => {
-  //   return name.toLowerCase().includes(qLower);
-  // };
 
   const applyFilter = (
     Contents: any[] | undefined,
@@ -523,6 +492,10 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     }
   };
 
+  // List objects routes
+  // Note: bucketName does NOT need decodeURIComponent - it's validated to URL-safe [a-z0-9-]
+  // (see validateBucketName in utils/validation.ts). Fastify auto-decodes URL params anyway.
+  // Prefix IS base64-encoded and is decoded within handleListRequest via validateAndDecodePrefix.
   fastify.get('/:bucketName', async (req: FastifyRequest, reply: FastifyReply) => {
     const { bucketName } = req.params as any;
     await handleListRequest(req, reply, bucketName, undefined);
@@ -538,7 +511,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     logAccess(req);
     const { s3Client } = getS3Config();
     const { bucketName, encodedKey } = req.params as any;
-    const key = atob(encodedKey);
+    const key = base64Decode(encodedKey);
 
     const command = new GetObjectCommand({
       Bucket: bucketName,
@@ -549,7 +522,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
       const item = await s3Client.send(command);
       return item.Body;
     } catch (err: any) {
-      req.log.error(err);
+      req.log.error(sanitizeErrorForLogging(err));
       if (err instanceof S3ServiceException) {
         reply.status(err.$metadata.httpStatusCode || 500).send({
           error: err.name || 'S3ServiceException',
@@ -572,7 +545,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
       logAccess(req);
       const { s3Client } = getS3Config();
       const { bucketName, encodedKey } = req.params as any;
-      const key = atob(encodedKey);
+      const key = base64Decode(encodedKey);
       const fileName = key.split('/').pop();
 
       const command = new GetObjectCommand({
@@ -599,7 +572,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
 
         return reply;
       } catch (err: any) {
-        req.log.error(err);
+        req.log.error(sanitizeErrorForLogging(err));
         if (err instanceof S3ServiceException) {
           reply.status(err.$metadata.httpStatusCode || 500).send({
             error: err.name || 'S3ServiceException',
@@ -621,7 +594,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     logAccess(req);
     const { s3Client } = getS3Config();
     const { bucketName, encodedKey } = req.params as any;
-    const objectName = atob(encodedKey); // This can also be the prefix
+    const objectName = base64Decode(encodedKey); // This can also be the prefix
 
     // Check if the objectName is a real object or a prefix
     const listCommand = new ListObjectsV2Command({
@@ -670,7 +643,6 @@ export default async (fastify: FastifyInstance): Promise<void> => {
 
   // Progress tracking for uploads
   const uploadProgresses: UploadProgresses = {};
-  const uploadErrors: UploadErrors = {};
 
   fastify.get('/upload-progress/:encodedKey', (req: FastifyRequest, reply: FastifyReply) => {
     const { encodedKey } = req.params as any;
@@ -728,7 +700,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
       logAccess(req);
       const { bucketName, encodedKey } = req.params as any;
       const { s3Client } = getS3Config();
-      const key = atob(encodedKey);
+      const key = base64Decode(encodedKey);
 
       const data = await req.file({
         limits: {
@@ -763,16 +735,25 @@ export default async (fastify: FastifyInstance): Promise<void> => {
           abortController: abortUploadController.current as AbortController,
         });
 
-        upload.on('httpUploadProgress', (progress: any) => {
-          uploadProgresses[encodedKey] = { loaded: progress.loaded || 0, status: 'uploading' };
-        });
+        // Throttled progress tracking to prevent memory leaks
+        const PROGRESS_THRESHOLD = 1024 * 1024; // 1MB
+        let lastReported = 0;
 
-        await upload.done();
+        const throttledProgress = (loaded: number) => {
+          // Only update progress every 1MB
+          if (loaded - lastReported >= PROGRESS_THRESHOLD) {
+            uploadProgresses[encodedKey] = { loaded, status: 'uploading' };
+            lastReported = loaded;
+          }
+        };
+
+        // Use uploadWithCleanup to ensure event listeners are removed
+        await uploadWithCleanup(upload, throttledProgress);
         uploadProgresses[encodedKey] = { loaded: 0, status: 'completed' };
         abortUploadController.current = null;
         reply.send({ message: 'Object uploaded successfully' });
       } catch (e: any) {
-        console.log(e);
+        console.error('Upload failed:', sanitizeErrorForLogging(e));
         abortUploadController.current = null;
         delete uploadProgresses[encodedKey];
         if (e instanceof S3ServiceException) {
@@ -795,110 +776,8 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     },
   );
 
-  // Model files downloader
-  const retrieveModelFile = async (
-    s3Client: S3Client,
-    bucketName: string,
-    prefix: string,
-    modelName: string,
-    file: Sibling,
-  ) => {
-    try {
-      const auth_headers = { Authorization: `Bearer ${getHFConfig()}` };
-      const fileUrl = 'https://huggingface.co/' + modelName + '/resolve/main/' + file.rfilename;
-
-      const { httpProxy, httpsProxy } = getProxyConfig();
-      const axiosOptions: AxiosRequestConfig = { headers: auth_headers };
-
-      if (fileUrl.startsWith('https://') && httpsProxy) {
-        axiosOptions.httpsAgent = new HttpsProxyAgent(httpsProxy);
-        axiosOptions.proxy = false;
-      } else if (fileUrl.startsWith('http://') && httpProxy) {
-        axiosOptions.httpAgent = new HttpProxyAgent(httpProxy);
-        axiosOptions.proxy = false;
-      }
-
-      const response = await axios.head(fileUrl, axiosOptions);
-      const fileSize = parseInt(response.headers['content-length'] || '0');
-
-      const streamAxiosOptions: AxiosRequestConfig = { ...axiosOptions, responseType: 'stream' };
-      const fileStream = (await axios.get(fileUrl, streamAxiosOptions)).data;
-
-      const target = {
-        Bucket: bucketName,
-        Key: prefix + modelName + '/' + file.rfilename,
-        Body: fileStream,
-      };
-      // Each model file download should have its own AbortController instance
-      const modelAbortController = new AbortController();
-      uploadProgresses[file.rfilename] = { loaded: 0, status: 'uploading', total: fileSize };
-
-      const upload = new Upload({
-        client: s3Client,
-        queueSize: 4, // optional concurrency configuration
-        leavePartsOnError: false, // optional manually handle dropped parts
-        params: target,
-        abortController: modelAbortController, // Use the dedicated controller
-      });
-
-      upload.on('httpUploadProgress', (progress: any) => {
-        uploadProgresses[file.rfilename] = {
-          loaded: progress.loaded || 0,
-          status: 'uploading',
-          total: fileSize,
-        };
-      });
-
-      await upload.done();
-      uploadProgresses[file.rfilename] = { loaded: fileSize, status: 'completed', total: fileSize };
-    } catch (e: any) {
-      if (e instanceof S3ServiceException) {
-        console.error(`S3 Error uploading ${file.rfilename}: ${e.name} - ${e.message}`);
-        uploadErrors[file.rfilename] = {
-          error: e.name || 'S3ServiceException',
-          message: e.message || `S3 Error uploading ${file.rfilename}: ${e.name} - ${e.message}`,
-        };
-      } else if (e.name === 'AbortError') {
-        console.error(`Upload aborted for ${file.rfilename}`);
-        uploadErrors[file.rfilename] = {
-          error: e.name || 'AbortError',
-          message: e.message || `Upload aborted for ${file.rfilename}`,
-        };
-      } else {
-        console.error(`Error retrieving/uploading ${file.rfilename}: ${e.message}`);
-        uploadErrors[file.rfilename] = {
-          error: e.name || 'Unknown error',
-          message: e.message || `Error retrieving/uploading ${file.rfilename}: ${e.message}`,
-        };
-      }
-      delete uploadProgresses[file.rfilename]; // Ensure progress is cleared on error
-      // Optionally, re-throw or handle more specifically if a single file failure should stop the batch
-    }
-  };
-
-  // Queue manager for model files
-  const startModelImport = async (
-    modelFiles: Siblings,
-    s3Client: S3Client,
-    bucketName: string,
-    prefix: string,
-    modelName: string,
-  ) => {
-    modelFiles.forEach((file: Sibling) => {
-      uploadProgresses[file.rfilename] = { loaded: 0, status: 'queued', total: 0 };
-    });
-    const limit = pLimit(getMaxConcurrentTransfers());
-    const promises = modelFiles.map((file: Sibling) =>
-      limit(() => retrieveModelFile(s3Client, bucketName, prefix, modelName, file)),
-    );
-    try {
-      await Promise.all(promises);
-    } catch (batchError: any) {
-      // This catch block might be hit if p-limit itself throws or if a promise reject isn't caught inside retrieveModelFile
-      console.error('Error during model import batch:', batchError);
-      // Decide on how to update overall status; individual errors are logged in retrieveModelFile
-    }
-  };
+  // NOTE: Old HuggingFace import implementation removed to fix memory leaks
+  // Use POST /huggingface-import with transferQueue instead
 
   // Interface for HuggingFace import request
   interface HuggingFaceImportRequest {
@@ -917,8 +796,13 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     destinationType: 's3' | 'local',
     hfToken: string | undefined,
     onProgress: (loaded: number) => void,
+    abortSignal: AbortSignal,
   ): Promise<void> {
     const { sourcePath, destinationPath } = fileJob;
+
+    // Memory profiling: Start of HF download
+    const fileName = path.basename(sourcePath);
+    logMemory(`[HF] Start download: ${fileName}`);
 
     // Parse destination path
     // Format: "s3:bucketName/path" or "local:locationId/path"
@@ -936,75 +820,182 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     const destLoc = destRemainder.substring(0, firstSlash);
     const destPath = destRemainder.substring(firstSlash + 1);
 
-    // Fetch from HuggingFace with proxy support
+    // Fetch from HuggingFace with native https module (zero buffering)
     const { httpProxy, httpsProxy } = getProxyConfig();
-    const axiosOptions: AxiosRequestConfig = {
-      responseType: 'stream',
-      headers: hfToken ? { Authorization: `Bearer ${hfToken}` } : {},
-    };
 
-    if (sourcePath.startsWith('https://') && httpsProxy) {
-      axiosOptions.httpsAgent = new HttpsProxyAgent(httpsProxy);
-      axiosOptions.proxy = false;
-    } else if (sourcePath.startsWith('http://') && httpProxy) {
-      axiosOptions.httpAgent = new HttpProxyAgent(httpProxy);
-      axiosOptions.proxy = false;
-    }
-
-    const response = await axios.get(sourcePath, axiosOptions);
-    const stream = response.data;
-
-    // Extract file size from Content-Length header
-    fileJob.size = parseInt(response.headers['content-length'] || '0', 10);
-
-    // Track progress
-    let loaded = 0;
-    const progressTransform = new Transform({
-      transform(chunk, encoding, callback) {
-        loaded += chunk.length;
-        onProgress(loaded);
-        callback(null, chunk);
-      },
-    });
-
-    // Write to destination
-    if (destinationType === 's3') {
-      // Upload to S3
-      const { s3Client } = getS3Config();
-      const upload = new Upload({
-        client: s3Client,
-        params: {
-          Bucket: destLoc,
-          Key: destPath,
-          Body: stream.pipe(progressTransform),
-        },
-      });
-      await upload.done();
-    } else {
-      // Write to local storage
-      // First, ensure parent directory structure exists
-      const parentRelativePath = path.dirname(destPath);
-
-      // Get validated base path
-      const basePath = await validatePath(destLoc, '.');
-
-      // Construct parent absolute path
-      const normalizedParent = path.normalize(parentRelativePath || '.');
-      const parentAbsolutePath = path.join(basePath, normalizedParent);
-
-      // Security check: ensure parent doesn't escape base
-      if (!parentAbsolutePath.startsWith(basePath + path.sep) && parentAbsolutePath !== basePath) {
-        throw new SecurityError(`Path escapes allowed directory: ${parentRelativePath}`);
+    // Recursive function to follow redirects
+    const makeRequest = (
+      currentUrl: string,
+      redirectCount = 0,
+    ): Promise<{ stream: Readable; contentLength: number }> => {
+      // Prevent infinite redirect loops
+      if (redirectCount > 10) {
+        return Promise.reject(new Error('Too many redirects (max 10)'));
       }
 
-      // Create directory structure recursively
-      await fs.mkdir(parentAbsolutePath, { recursive: true });
+      const url = new URL(currentUrl);
 
-      // Now validate the full file path (will succeed because parent exists)
-      const absolutePath = await validatePath(destLoc, destPath);
+      // Prepare request options
+      const requestOptions: any = {
+        hostname: url.hostname,
+        port: url.port || (url.protocol === 'https:' ? 443 : 80),
+        path: url.pathname + url.search,
+        method: 'GET',
+        headers: hfToken ? { Authorization: `Bearer ${hfToken}` } : {},
+        signal: abortSignal, // Add abort signal to cancel HTTP request
+      };
 
-      // Stream to file
-      await pipelineAsync(stream, progressTransform, createWriteStream(absolutePath));
+      // Add proxy agent if configured
+      if (url.protocol === 'https:' && httpsProxy) {
+        requestOptions.agent = new HttpsProxyAgent(httpsProxy);
+      } else if (url.protocol === 'http:' && httpProxy) {
+        requestOptions.agent = new HttpProxyAgent(httpProxy);
+      }
+
+      return new Promise<{ stream: Readable; contentLength: number }>((resolve, reject) => {
+        const req = (url.protocol === 'https:' ? httpsRequest : httpRequest)(
+          requestOptions,
+          (res) => {
+            const statusCode = res.statusCode || 0;
+
+            // Handle redirects (301, 302, 307, 308)
+            if (statusCode >= 300 && statusCode < 400) {
+              const location = res.headers.location;
+              if (!location) {
+                reject(new Error(`Redirect response missing Location header (${statusCode})`));
+                return;
+              }
+
+              // Consume redirect response body to free memory
+              res.resume();
+
+              // Resolve relative URLs against current URL (e.g., '/api/cache/file')
+              const redirectUrl = new URL(location, currentUrl);
+
+              // Follow redirect recursively
+              makeRequest(redirectUrl.href, redirectCount + 1)
+                .then(resolve)
+                .catch(reject);
+              return;
+            }
+
+            // Handle success (200)
+            if (statusCode === 200) {
+              const contentLength = parseInt(res.headers['content-length'] || '0', 10);
+              resolve({ stream: res, contentLength });
+              return;
+            }
+
+            // Handle errors (non-200, non-redirect)
+            reject(
+              new Error(
+                `HTTP request failed: ${statusCode} ${res.statusMessage || 'Unknown error'}`,
+              ),
+            );
+          },
+        );
+
+        req.on('error', reject);
+        req.end();
+      });
+    };
+
+    // Make initial request (will follow redirects automatically)
+    const { stream, contentLength } = await makeRequest(sourcePath);
+
+    fileJob.size = contentLength;
+
+    // Memory profiling: HTTP response received
+    const sizeInMB = (contentLength / (1024 * 1024)).toFixed(2);
+    logMemory(`[HF] Response received: ${fileName} (${sizeInMB} MB)`);
+
+    // Track progress with throttling to prevent memory leaks
+    const progressTransform = createProgressTransform(onProgress);
+
+    // Add abort handling to progress transform
+    if (abortSignal) {
+      const abortHandler = () => {
+        progressTransform.destroy(new Error('Transfer cancelled'));
+      };
+      abortSignal.addEventListener('abort', abortHandler);
+      progressTransform.on('close', () => {
+        abortSignal.removeEventListener('abort', abortHandler);
+      });
+    }
+
+    // Memory profiling: Before pipeline setup
+    logMemory(`[HF] Before pipeline: ${fileName}`);
+
+    try {
+      // Write to destination
+      if (destinationType === 's3') {
+        // Upload to S3
+        const { s3Client } = getS3Config();
+
+        // Use PassThrough stream to combine axios stream with progress tracking
+        // while maintaining backpressure control
+        const passThrough = new PassThrough({
+          highWaterMark: 64 * 1024, // 64KB chunks - prevents excessive buffering
+        });
+
+        // Pipeline with native backpressure: http → progress → passthrough
+        const pipelinePromise = pipelineAsync(stream, progressTransform, passThrough);
+
+        // Upload reads from passthrough with proper backpressure
+        const upload = new Upload({
+          client: s3Client,
+          params: {
+            Bucket: destLoc,
+            Key: destPath,
+            Body: passThrough,
+          },
+        });
+
+        // Wait for both to complete
+        await Promise.all([upload.done(), pipelinePromise]);
+
+        // Memory profiling: S3 upload complete
+        logMemory(`[HF] S3 upload complete: ${fileName}`);
+      } else {
+        // Write to local storage
+        // First, ensure parent directory structure exists
+        const parentRelativePath = path.dirname(destPath);
+
+        // Get validated base path
+        const basePath = await validatePath(destLoc, '.');
+
+        // Construct parent absolute path
+        const normalizedParent = path.normalize(parentRelativePath || '.');
+        const parentAbsolutePath = path.join(basePath, normalizedParent);
+
+        // Security check: ensure parent doesn't escape base
+        if (
+          !parentAbsolutePath.startsWith(basePath + path.sep) &&
+          parentAbsolutePath !== basePath
+        ) {
+          throw new SecurityError(`Path escapes allowed directory: ${parentRelativePath}`);
+        }
+
+        // Create directory structure recursively
+        await fs.mkdir(parentAbsolutePath, { recursive: true });
+
+        // Now validate the full file path (will succeed because parent exists)
+        const absolutePath = await validatePath(destLoc, destPath);
+
+        // Stream to file with native backpressure
+        await pipelineAsync(stream, progressTransform, createWriteStream(absolutePath));
+
+        // Memory profiling: Local file write complete
+        logMemory(`[HF] Local write complete: ${fileName}`);
+      }
+    } catch (error) {
+      // Memory profiling: Error occurred
+      logMemory(`[HF] Error during transfer: ${fileName}`);
+
+      // Critical: Destroy streams on error to prevent memory leaks
+      stream.destroy();
+      progressTransform.destroy();
+      throw error;
     }
   }
 
@@ -1140,9 +1131,13 @@ export default async (fastify: FastifyInstance): Promise<void> => {
       });
 
       // Queue transfer job
-      const jobId = transferQueue.queueJob('huggingface', files, async (fileJob, onProgress) => {
-        await downloadHuggingFaceFile(fileJob, destinationType, hfToken, onProgress);
-      });
+      const jobId = transferQueue.queueJob(
+        'huggingface',
+        files,
+        async (fileJob, onProgress, abortSignal) => {
+          await downloadHuggingFaceFile(fileJob, destinationType, hfToken, onProgress, abortSignal);
+        },
+      );
 
       // Return job ID and SSE URL
       // SSE endpoint is at /api/transfer/progress/:jobId
@@ -1155,165 +1150,6 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     },
   );
 
-  // Import model from Hugging Face (existing GET route for backward compatibility)
-  fastify.get(
-    '/hf-import/:bucketName/:encodedPrefix/:encodedModelName',
-    async (req: FastifyRequest, reply: FastifyReply) => {
-      logAccess(req);
-      const { bucketName, encodedPrefix, encodedModelName } = req.params as any;
-      let prefix = atob(encodedPrefix);
-      prefix = prefix === 'there_is_no_prefix' ? '' : prefix;
-      const modelName = atob(encodedModelName);
-      const { s3Client } = getS3Config();
-      let modelInfo: any = {};
-      try {
-        const { httpProxy, httpsProxy } = getProxyConfig();
-        const modelInfoUrl = 'https://huggingface.co/api/models/' + modelName + '?';
-        const axiosOptions: AxiosRequestConfig = {
-          headers: {
-            Authorization: `Bearer ${getHFConfig()}`,
-          },
-        };
-
-        if (modelInfoUrl.startsWith('https://') && httpsProxy) {
-          axiosOptions.httpsAgent = new HttpsProxyAgent(httpsProxy);
-          axiosOptions.proxy = false;
-        } else if (modelInfoUrl.startsWith('http://') && httpProxy) {
-          axiosOptions.httpAgent = new HttpProxyAgent(httpProxy);
-          axiosOptions.proxy = false;
-        }
-        modelInfo = await axios.get(modelInfoUrl, axiosOptions);
-      } catch (error: any) {
-        reply.code(error.response?.status || 500).send({
-          error: error.response?.data?.error || 'Hugging Face API error',
-          message: error.response?.data?.error || 'Error fetching model info from Hugging Face',
-        });
-        return;
-      }
-      const modelGated = modelInfo.data.gated;
-      let authorizedUser = true;
-      if (modelGated !== false) {
-        try {
-          const { httpProxy, httpsProxy } = getProxyConfig();
-          const whoAmIUrl = 'https://huggingface.co/api/whoami-v2?';
-          const axiosOptions: AxiosRequestConfig = {
-            headers: {
-              Authorization: `Bearer ${getHFConfig()}`,
-            },
-          };
-
-          if (whoAmIUrl.startsWith('https://') && httpsProxy) {
-            axiosOptions.httpsAgent = new HttpsProxyAgent(httpsProxy);
-            axiosOptions.proxy = false;
-          } else if (whoAmIUrl.startsWith('http://') && httpProxy) {
-            axiosOptions.httpAgent = new HttpProxyAgent(httpProxy);
-            axiosOptions.proxy = false;
-          }
-          await axios.get(whoAmIUrl, axiosOptions);
-        } catch (error) {
-          authorizedUser = false;
-        }
-      }
-      if (!authorizedUser) {
-        reply
-          .code(401) // Changed to 401 Unauthorized
-          .send({
-            error: 'Unauthorized',
-            message:
-              'This model requires a valid HuggingFace token to be downloaded, or you are not authorized. Check your settings.',
-          });
-        return;
-      } else {
-        const modelFiles: Siblings = modelInfo.data.siblings;
-        startModelImport(modelFiles, s3Client, bucketName, prefix, modelName);
-        reply.send({ message: 'Model import started' });
-      }
-    },
-  );
-
-  fastify.get('/import-model-progress', (req: FastifyRequest, reply: FastifyReply) => {
-    reply.raw.setHeader('Access-Control-Allow-Origin', '*');
-    reply.raw.setHeader(
-      'Access-Control-Allow-Headers',
-      'Origin, X-Requested-With, Content-Type, Accept',
-    );
-    reply.raw.setHeader('Content-Type', 'text/event-stream');
-    reply.raw.setHeader('Cache-Control', 'no-cache');
-    reply.raw.setHeader('Connection', 'keep-alive');
-
-    const sendEvent = (data: any) => {
-      reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
-    };
-
-    const interval = setInterval(() => {
-      if (Object.keys(uploadProgresses).length > 0) {
-        sendEvent(uploadProgresses);
-      }
-
-      if (Object.keys(uploadErrors).length > 0) {
-        sendEvent(uploadErrors);
-        // Clear errors after sending
-        Object.keys(uploadErrors).forEach((key) => delete uploadErrors[key]);
-      }
-
-      const allCompleted = Object.keys(uploadProgresses)
-        .map((k) => uploadProgresses[k])
-        .every((item: UploadProgress) => item.status === 'completed');
-      const noActiveUploads = Object.keys(uploadProgresses)
-        .map((k) => uploadProgresses[k])
-        .every(
-          (item: UploadProgress) => item.status === 'completed' || item.status === 'idle', // Assuming 'idle' means error/not started
-        );
-
-      // End stream if all are completed OR if there are no active/queued uploads left (implying errors might have occurred)
-      if (Object.keys(uploadProgresses).length > 0 && noActiveUploads) {
-        // Check if any were not completed to decide if it was a full success
-        const anyNotCompleted = Object.keys(uploadProgresses)
-          .map((k) => uploadProgresses[k])
-          .some((item: UploadProgress) => item.status !== 'completed');
-        if (anyNotCompleted) {
-          console.log('Model import process finished, but some files may have failed.');
-        } else {
-          console.log('All model uploads completed successfully.');
-        }
-
-        // Send last errors if any
-        if (Object.keys(uploadErrors).length > 0) {
-          sendEvent(uploadErrors);
-          // Clear errors after sending
-          Object.keys(uploadErrors).forEach((key) => delete uploadErrors[key]);
-        }
-
-        // Clear the interval and end the stream
-        clearInterval(interval);
-        Object.keys(uploadProgresses).forEach((key) => delete uploadProgresses[key]);
-        reply.raw.end();
-        return;
-      }
-      // If there are no progresses at all, and it wasn't just cleared, also end.
-      if (Object.keys(uploadProgresses).length === 0 && !allCompleted) {
-        // This case might happen if import started but failed before any progress was made, or client disconnected early
-        // Or if all were completed and cleared in a previous tick.
-        // To prevent spamming end(), we rely on the check above mostly.
-        // However, if it becomes empty and not due to completion, we should also stop.
-        // This logic might need refinement based on how `startModelImport` signals overall completion/failure.
-        // For now, if it's empty and not all were marked completed in a prior step, assume it's done (possibly with errors).
-        console.log('Model import progress stream closing due to no active or pending tasks.');
-        clearInterval(interval);
-        reply.raw.end();
-      }
-    }, 1000);
-
-    // Handle client disconnect
-    req.raw.on('close', () => {
-      console.log('Client disconnected from model import progress.');
-      Object.keys(uploadProgresses).forEach((key) => {
-        // Here, we don't try to abort S3 uploads as the AbortController was per-file and might be out of scope
-        // or the upload might have finished/failed already. Clearing progress is the main action.
-        delete uploadProgresses[key];
-      });
-      clearInterval(interval);
-      // reply.raw.end() is implicitly handled by connection close
-    });
-  });
+  // NOTE: Old GET /hf-import and /import-model-progress routes removed to fix memory leaks
+  // Use POST /huggingface-import with /transfer/progress/:jobId instead
 };

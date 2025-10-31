@@ -1,3 +1,5 @@
+import { formatBytes } from '@app/utils/format';
+
 export interface UploadedFile {
     fileName: string;
     path?: string;
@@ -41,17 +43,6 @@ export class BucketsList {
     }
 }
 
-const formatBytes = (bytes: number): string => {
-    if (bytes === 0) {
-        return '0 B';
-    }
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    const value = parseFloat((bytes / Math.pow(k, i)).toFixed(2));
-    return `${value} ${sizes[i]}`;
-};
-
 export class S3Object {
     Key: string;
     LastModified: string;
@@ -88,15 +79,4 @@ export class S3Prefixes {
     constructor(Prefixes: S3Prefix[]) {
         this.s3Prefixes = Prefixes;
     }
-}
-
-export interface ObjectRow {
-    key: string;
-    lastModified: string;
-    size: string;
-    originalSize: number;
-}
-
-export interface PrefixRow {
-    prefix: string;
 }

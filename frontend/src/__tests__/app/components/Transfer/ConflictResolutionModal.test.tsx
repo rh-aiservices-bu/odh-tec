@@ -2,22 +2,8 @@ import React from 'react';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ConflictResolutionModal } from '@app/components/Transfer/ConflictResolutionModal';
-import { TransferConflict } from '@app/services/storageService';
 
-describe('ConflictResolutionModal', () => {
-  const mockConflicts: TransferConflict[] = [
-    {
-      path: 'file1.txt',
-      existingSize: 1024,
-      existingModified: new Date('2024-01-01'),
-    },
-    {
-      path: 'file2.txt',
-      existingSize: 2048,
-      existingModified: new Date('2024-01-02'),
-    },
-  ];
-
+describe('ConflictResolutionModal - Smart Conflict UI', () => {
   const mockOnResolve = jest.fn();
   const mockOnCancel = jest.fn();
 
@@ -25,187 +11,255 @@ describe('ConflictResolutionModal', () => {
     jest.clearAllMocks();
   });
 
-  it('should display all conflicts', () => {
+  it('should show non-conflicting files info', () => {
     render(
       <ConflictResolutionModal
         isOpen={true}
-        conflicts={mockConflicts}
+        conflictingFiles={['file2.txt']}
+        nonConflictingFiles={['file1.txt', 'file3.txt']}
         onResolve={mockOnResolve}
         onCancel={mockOnCancel}
       />
     );
 
-    expect(screen.getByText('file1.txt')).toBeInTheDocument();
-    expect(screen.getByText('file2.txt')).toBeInTheDocument();
-    expect(screen.getByText(/2 file\(s\) already exist/)).toBeInTheDocument();
+    expect(screen.getByText(/2 files will be copied automatically \(no conflicts\)/i)).toBeInTheDocument();
   });
 
-  it('should display file metadata', () => {
+  it('should show conflicting files count', () => {
     render(
       <ConflictResolutionModal
         isOpen={true}
-        conflicts={mockConflicts}
+        conflictingFiles={['file1.txt', 'file2.txt', 'file3.txt']}
+        nonConflictingFiles={['file4.txt']}
         onResolve={mockOnResolve}
         onCancel={mockOnCancel}
       />
     );
 
-    expect(screen.getByText(/1\.00 KB/)).toBeInTheDocument();
-    expect(screen.getByText(/2\.00 KB/)).toBeInTheDocument();
+    expect(screen.getByText(/3 files already exist/i)).toBeInTheDocument();
   });
 
-  it('should allow selecting resolution per file', async () => {
+  it('should list first 25 conflicting files', () => {
+    const manyConflicts = Array.from({ length: 50 }, (_, i) => `file${i}.txt`);
+
+    render(
+      <ConflictResolutionModal
+        isOpen={true}
+        conflictingFiles={manyConflicts}
+        nonConflictingFiles={[]}
+        onResolve={mockOnResolve}
+        onCancel={mockOnCancel}
+      />
+    );
+
+    expect(screen.getByText(/Showing first 25 of 50 conflicts/i)).toBeInTheDocument();
+    const listItems = screen.getAllByRole('listitem');
+    expect(listItems).toHaveLength(25);
+  });
+
+  it('should call onResolve with selected resolution', async () => {
     const user = userEvent.setup();
+
     render(
       <ConflictResolutionModal
         isOpen={true}
-        conflicts={mockConflicts}
+        conflictingFiles={['file1.txt']}
+        nonConflictingFiles={[]}
         onResolve={mockOnResolve}
         onCancel={mockOnCancel}
       />
     );
 
-    // Get all radios - should be 6 (3 for each conflict)
-    const radios = screen.getAllByRole('radio');
-    expect(radios).toHaveLength(6);
+    // Select overwrite
+    const overwriteRadio = screen.getByRole('radio', { name: /overwrite/i });
+    await user.click(overwriteRadio);
 
-    // Select overwrite for first file (index 0)
-    await user.click(radios[0]);
-    expect(radios[0]).toBeChecked();
+    // Apply
+    const applyButton = screen.getByRole('button', { name: /apply/i });
+    await user.click(applyButton);
+
+    expect(mockOnResolve).toHaveBeenCalledWith('overwrite');
   });
 
-  it('should apply resolution to all conflicts when "Apply to all" is selected', async () => {
-    const user = userEvent.setup();
+  it('should update summary based on resolution choice - skip', () => {
     render(
       <ConflictResolutionModal
         isOpen={true}
-        conflicts={mockConflicts}
+        conflictingFiles={['file1.txt', 'file2.txt']}
+        nonConflictingFiles={['file3.txt']}
         onResolve={mockOnResolve}
         onCancel={mockOnCancel}
       />
     );
 
-    // Select "Overwrite all" in apply to all dropdown
-    const applyToAllSelect = screen.getByRole('combobox');
-    await user.selectOptions(applyToAllSelect, 'overwrite');
-
-    // Click proceed
-    const proceedButton = screen.getByText('Proceed with Transfer');
-    await user.click(proceedButton);
-
-    expect(mockOnResolve).toHaveBeenCalledWith({
-      'file1.txt': 'overwrite',
-      'file2.txt': 'overwrite',
-    });
+    // Default: skip
+    expect(screen.getByText(/Total: 1 files will be copied/i)).toBeInTheDocument();
+    expect(screen.getByText(/2 conflicts will be skipped/i)).toBeInTheDocument();
   });
 
-  it('should use "rename" as default resolution when none selected', async () => {
+  it('should update summary based on resolution choice - overwrite', async () => {
     const user = userEvent.setup();
+
     render(
       <ConflictResolutionModal
         isOpen={true}
-        conflicts={mockConflicts}
+        conflictingFiles={['file1.txt', 'file2.txt']}
+        nonConflictingFiles={['file3.txt']}
         onResolve={mockOnResolve}
         onCancel={mockOnCancel}
       />
     );
 
-    const proceedButton = screen.getByText('Proceed with Transfer');
-    await user.click(proceedButton);
+    // Change to overwrite
+    const overwriteRadio = screen.getByRole('radio', { name: /overwrite/i });
+    await user.click(overwriteRadio);
 
-    expect(mockOnResolve).toHaveBeenCalledWith({
-      'file1.txt': 'rename',
-      'file2.txt': 'rename',
-    });
+    expect(screen.getByText(/Total: 3 files will be copied/i)).toBeInTheDocument();
+    expect(screen.getByText(/2 conflicts will be overwritten/i)).toBeInTheDocument();
   });
 
-  it('should call onResolve with mixed resolutions', async () => {
+  it('should update summary based on resolution choice - rename', async () => {
     const user = userEvent.setup();
+
     render(
       <ConflictResolutionModal
         isOpen={true}
-        conflicts={mockConflicts}
+        conflictingFiles={['file1.txt', 'file2.txt']}
+        nonConflictingFiles={['file3.txt']}
         onResolve={mockOnResolve}
         onCancel={mockOnCancel}
       />
     );
 
-    // Select overwrite for first file and skip for second
-    const radios = screen.getAllByRole('radio');
-    // First set of 3 radios is for file1, click "overwrite" (index 0)
-    await user.click(radios[0]);
-    // Second set of 3 radios is for file2, click "skip" (index 4)
-    await user.click(radios[4]);
+    // Change to rename
+    const renameRadio = screen.getByRole('radio', { name: /rename/i });
+    await user.click(renameRadio);
 
-    const proceedButton = screen.getByText('Proceed with Transfer');
-    await user.click(proceedButton);
-
-    expect(mockOnResolve).toHaveBeenCalledWith({
-      'file1.txt': 'overwrite',
-      'file2.txt': 'skip',
-    });
+    expect(screen.getByText(/Total: 3 files will be copied/i)).toBeInTheDocument();
+    expect(screen.getByText(/2 conflicts will be renamed/i)).toBeInTheDocument();
   });
 
-  it('should call onCancel when cancel is clicked', async () => {
-    const user = userEvent.setup();
+  it('should handle no non-conflicting files', () => {
     render(
       <ConflictResolutionModal
         isOpen={true}
-        conflicts={mockConflicts}
+        conflictingFiles={['file1.txt']}
+        nonConflictingFiles={[]}
         onResolve={mockOnResolve}
         onCancel={mockOnCancel}
       />
     );
 
-    const cancelButton = screen.getByText('Cancel');
+    expect(screen.queryByText(/will be copied automatically \(no conflicts\)/i)).not.toBeInTheDocument();
+  });
+
+  it('should call onCancel when cancel button is clicked', async () => {
+    const user = userEvent.setup();
+
+    render(
+      <ConflictResolutionModal
+        isOpen={true}
+        conflictingFiles={['file1.txt']}
+        nonConflictingFiles={[]}
+        onResolve={mockOnResolve}
+        onCancel={mockOnCancel}
+      />
+    );
+
+    const cancelButton = screen.getByRole('button', { name: /cancel/i });
     await user.click(cancelButton);
 
     expect(mockOnCancel).toHaveBeenCalledTimes(1);
   });
 
-  it('should show all three resolution options for each conflict', () => {
+  it('should show all three resolution options', () => {
     render(
       <ConflictResolutionModal
         isOpen={true}
-        conflicts={[mockConflicts[0]]}
+        conflictingFiles={['file1.txt']}
+        nonConflictingFiles={[]}
         onResolve={mockOnResolve}
         onCancel={mockOnCancel}
       />
     );
 
-    const radios = screen.getAllByRole('radio');
-    // Should have 3 radio buttons for the single conflict
-    expect(radios).toHaveLength(3);
-    expect(screen.getByText('Overwrite')).toBeInTheDocument();
-    expect(screen.getByText('Skip')).toBeInTheDocument();
-    expect(screen.getByText('Keep both (rename)')).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: /skip/i })).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: /overwrite/i })).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: /rename/i })).toBeInTheDocument();
   });
 
-  it('should not render when modal is closed', () => {
-    render(
-      <ConflictResolutionModal
-        isOpen={false}
-        conflicts={mockConflicts}
-        onResolve={mockOnResolve}
-        onCancel={mockOnCancel}
-      />
-    );
-
-    expect(screen.queryByText('File Conflicts Detected')).not.toBeInTheDocument();
-  });
-
-  it('should show warning alert', () => {
+  it('should have skip as default resolution', () => {
     render(
       <ConflictResolutionModal
         isOpen={true}
-        conflicts={mockConflicts}
+        conflictingFiles={['file1.txt']}
+        nonConflictingFiles={[]}
         onResolve={mockOnResolve}
         onCancel={mockOnCancel}
       />
     );
 
-    // The modal title is in the dialog
-    expect(screen.getByRole('dialog')).toBeInTheDocument();
-    expect(screen.getByText(/2 file\(s\) already exist/)).toBeInTheDocument();
+    const skipRadio = screen.getByRole('radio', { name: /skip/i }) as HTMLInputElement;
+    expect(skipRadio.checked).toBe(true);
+  });
+
+  it('should not show conflict list truncation message when less than 25 conflicts', () => {
+    render(
+      <ConflictResolutionModal
+        isOpen={true}
+        conflictingFiles={['file1.txt', 'file2.txt', 'file3.txt']}
+        nonConflictingFiles={[]}
+        onResolve={mockOnResolve}
+        onCancel={mockOnCancel}
+      />
+    );
+
+    expect(screen.queryByText(/Showing first 25 of/i)).not.toBeInTheDocument();
+  });
+
+  it('should display modal title', () => {
+    render(
+      <ConflictResolutionModal
+        isOpen={true}
+        conflictingFiles={['file1.txt']}
+        nonConflictingFiles={[]}
+        onResolve={mockOnResolve}
+        onCancel={mockOnCancel}
+      />
+    );
+
+    expect(screen.getByText('Resolve File Conflicts')).toBeInTheDocument();
+  });
+
+  it('should handle single file conflict correctly', () => {
+    render(
+      <ConflictResolutionModal
+        isOpen={true}
+        conflictingFiles={['file1.txt']}
+        nonConflictingFiles={['file2.txt']}
+        onResolve={mockOnResolve}
+        onCancel={mockOnCancel}
+      />
+    );
+
+    // Singular form for 1 file
+    expect(screen.getByText(/1 file will be copied automatically \(no conflicts\)/i)).toBeInTheDocument();
+    expect(screen.getByText(/1 file already exists/i)).toBeInTheDocument();
+  });
+
+  it('should handle multiple files conflict correctly', () => {
+    render(
+      <ConflictResolutionModal
+        isOpen={true}
+        conflictingFiles={['file1.txt', 'file2.txt']}
+        nonConflictingFiles={['file3.txt', 'file4.txt']}
+        onResolve={mockOnResolve}
+        onCancel={mockOnCancel}
+      />
+    );
+
+    // Plural form for multiple files
+    expect(screen.getByText(/2 files will be copied automatically \(no conflicts\)/i)).toBeInTheDocument();
+    expect(screen.getByText(/2 files already exist/i)).toBeInTheDocument();
   });
 });

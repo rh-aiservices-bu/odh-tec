@@ -76,6 +76,7 @@ podman run --rm -it -p 8888:8888 --env-file=.env odh-tec:latest
 - **S3 Compatibility**: Supports both AWS S3 and S3-compatible endpoints
 - **Runtime Configuration**: Settings UI allows ephemeral overrides (not persisted)
 - **Environment Auto-Detection**: Automatically picks up ODH/RHOAI Data Connection environment variables
+- **URL Path Prefix Support**: Configurable via `NB_PREFIX` environment variable for Gateway API/Ingress routing
 
 ## Documentation Map
 

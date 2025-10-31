@@ -1,5 +1,12 @@
 import axios from 'axios';
-import { storageService, StorageLocation, FileEntry } from '@app/services/storageService';
+import {
+  storageService,
+  StorageLocation,
+  FileEntry,
+  TransferItem,
+  TransferRequest,
+  ConflictCheckResponse
+} from '@app/services/storageService';
 import config from '@app/config';
 
 // Mock axios
@@ -429,23 +436,35 @@ describe('StorageService', () => {
       mockedAxios.post.mockResolvedValueOnce({
         data: {
           conflicts: ['file1.txt', 'file2.txt'],
+          nonConflicting: ['file3.txt'],
         },
       });
 
-      const conflicts = await storageService.checkConflicts(
-        { type: 'local', locationId: 'local-0', path: 'dest/' },
-        ['file1.txt', 'file2.txt', 'file3.txt'],
+      const items: TransferItem[] = [
+        { path: 'file1.txt', type: 'file' },
+        { path: 'file2.txt', type: 'file' },
+        { path: 'file3.txt', type: 'file' }
+      ];
+
+      const response = await storageService.checkConflicts(
+        'src',
+        'source/',
+        items,
+        'local-0',
+        'dest/'
       );
 
       expect(mockedAxios.post).toHaveBeenCalledWith(
         `${config.backend_api_url}/transfer/check-conflicts`,
         {
+          source: { type: 'local', locationId: 'src', path: 'source/' },
           destination: { type: 'local', locationId: 'local-0', path: 'dest/' },
-          files: ['file1.txt', 'file2.txt', 'file3.txt'],
+          items,
         },
       );
 
-      expect(conflicts).toEqual(['file1.txt', 'file2.txt']);
+      expect(response.conflicts).toEqual(['file1.txt', 'file2.txt']);
+      expect(response.nonConflicting).toEqual(['file3.txt']);
     });
   });
 
@@ -458,10 +477,13 @@ describe('StorageService', () => {
         },
       });
 
-      const request = {
+      const request: TransferRequest = {
         source: { type: 's3' as const, locationId: 'bucket1', path: 'source/' },
         destination: { type: 'local' as const, locationId: 'local-0', path: 'dest/' },
-        files: ['file1.txt', 'file2.txt'],
+        items: [
+          { path: 'file1.txt', type: 'file' },
+          { path: 'file2.txt', type: 'file' }
+        ],
         conflictResolution: 'rename' as const,
       };
 

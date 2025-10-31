@@ -1,6 +1,7 @@
 import pLimit from 'p-limit';
 import { EventEmitter } from 'events';
 import { getMaxConcurrentTransfers } from './config';
+import { startPeriodicLogging, stopPeriodicLogging, logMemory } from './memoryProfiler';
 
 /**
  * Transfer job status
@@ -32,6 +33,7 @@ export interface TransferFileJob {
   loaded: number;
   status: TransferFileStatus;
   error?: string;
+  isMarker?: boolean; // Flag for .s3keep marker files
 }
 
 /**
@@ -59,6 +61,7 @@ export interface TransferJob {
   startedAt?: Date;
   completedAt?: Date;
   error?: string;
+  abortController: AbortController; // For cancelling in-progress transfers
 }
 
 /**
@@ -67,6 +70,7 @@ export interface TransferJob {
 export type TransferExecutor = (
   file: TransferFileJob,
   onProgress: (loaded: number) => void,
+  abortSignal: AbortSignal,
 ) => Promise<void>;
 
 /**
@@ -78,6 +82,8 @@ export class TransferQueue extends EventEmitter {
   private jobs: Map<string, TransferJob>;
   private activeTransfers: Set<string>;
   private nextJobId: number;
+  private lastEmitTime: Map<string, number>; // Track last emit time per job for throttling
+  private memoryMonitoringTimers: Map<string, NodeJS.Timeout>; // Track periodic memory logging timers
 
   constructor(concurrencyLimit: number) {
     super();
@@ -85,6 +91,8 @@ export class TransferQueue extends EventEmitter {
     this.jobs = new Map();
     this.activeTransfers = new Set();
     this.nextJobId = 1;
+    this.lastEmitTime = new Map();
+    this.memoryMonitoringTimers = new Map();
   }
 
   /**
@@ -117,6 +125,9 @@ export class TransferQueue extends EventEmitter {
 
   /**
    * Update job status and emit event
+   *
+   * Throttles event emission to max 1 per second to prevent memory issues
+   * when transferring large files with many progress updates.
    */
   private updateJob(jobId: string): void {
     const job = this.jobs.get(jobId);
@@ -129,6 +140,8 @@ export class TransferQueue extends EventEmitter {
       this.emit('job-updated', job);
       return;
     }
+
+    const previousStatus = job.status;
 
     // Update overall job status
     if (job.files.every((f) => f.status === 'completed')) {
@@ -149,7 +162,30 @@ export class TransferQueue extends EventEmitter {
       }
     }
 
-    this.emit('job-updated', job);
+    // Throttle event emission to prevent memory issues
+    const EMIT_THROTTLE_MS = 1000; // 1 second
+    const now = Date.now();
+    const lastEmit = this.lastEmitTime.get(jobId) || 0;
+    const isStatusChange = previousStatus !== job.status;
+    const isTerminalStatus = job.status === 'completed' || job.status === 'failed';
+    const shouldEmit = isStatusChange || isTerminalStatus || now - lastEmit >= EMIT_THROTTLE_MS;
+
+    if (shouldEmit) {
+      this.emit('job-updated', job);
+      this.lastEmitTime.set(jobId, now);
+
+      // Clean up tracking for completed jobs
+      if (isTerminalStatus) {
+        this.lastEmitTime.delete(jobId);
+
+        // Stop periodic memory monitoring for completed/failed jobs
+        const timer = this.memoryMonitoringTimers.get(jobId);
+        if (timer) {
+          stopPeriodicLogging(timer);
+          this.memoryMonitoringTimers.delete(jobId);
+        }
+      }
+    }
   }
 
   /**
@@ -178,6 +214,7 @@ export class TransferQueue extends EventEmitter {
       })),
       progress: this.calculateProgress([]),
       createdAt: new Date(),
+      abortController: new AbortController(), // Create abort controller for this job
     };
 
     this.jobs.set(jobId, job);
@@ -197,11 +234,16 @@ export class TransferQueue extends EventEmitter {
     const job = this.jobs.get(jobId);
     if (!job) return;
 
+    // Start periodic memory monitoring for this job
+    const memoryTimer = startPeriodicLogging(5000, `[Transfer ${jobId}]`);
+    this.memoryMonitoringTimers.set(jobId, memoryTimer);
+    logMemory(`[Transfer ${jobId}] Job started - ${job.files.length} files queued`);
+
     // Process each file with concurrency limit
     const promises = job.files.map((file) =>
       this.limiter(async () => {
-        // Check if job was cancelled
-        if (job.status === 'cancelled') {
+        // Check if job was cancelled or aborted before starting
+        if (job.status === 'cancelled' || job.abortController.signal.aborted) {
           file.status = 'error';
           file.error = 'Job cancelled';
           return;
@@ -211,17 +253,26 @@ export class TransferQueue extends EventEmitter {
           file.status = 'transferring';
           this.updateJob(jobId);
 
-          // Execute transfer with progress callback
-          await executor(file, (loaded: number) => {
-            file.loaded = loaded;
-            this.updateJob(jobId);
-          });
+          // Execute transfer with progress callback and abort signal
+          await executor(
+            file,
+            (loaded: number) => {
+              file.loaded = loaded;
+              this.updateJob(jobId);
+            },
+            job.abortController.signal, // Pass abort signal to executor
+          );
 
           file.status = 'completed';
           file.loaded = file.size;
         } catch (error: any) {
           file.status = 'error';
-          file.error = error.message || 'Transfer failed';
+          // Check if error was due to abort
+          if (error.name === 'AbortError' || job.abortController.signal.aborted) {
+            file.error = 'Cancelled by user';
+          } else {
+            file.error = error.message || 'Transfer failed';
+          }
         }
 
         this.updateJob(jobId);
@@ -229,6 +280,14 @@ export class TransferQueue extends EventEmitter {
     );
 
     await Promise.all(promises);
+
+    // Stop periodic memory monitoring
+    const timer = this.memoryMonitoringTimers.get(jobId);
+    if (timer) {
+      stopPeriodicLogging(timer);
+      this.memoryMonitoringTimers.delete(jobId);
+    }
+    logMemory(`[Transfer ${jobId}] Job finished`);
   }
 
   /**
@@ -240,10 +299,16 @@ export class TransferQueue extends EventEmitter {
 
   /**
    * Cancel an active job
+   * Aborts all in-progress transfers and cleans up resources
    */
   cancelJob(jobId: string): boolean {
     const job = this.jobs.get(jobId);
     if (!job) return false;
+
+    // Abort all in-progress transfers
+    // This triggers AbortSignal listeners in transfer functions
+    // which will destroy streams and clean up intervals
+    job.abortController.abort();
 
     job.status = 'cancelled';
     job.completedAt = new Date();
@@ -256,6 +321,13 @@ export class TransferQueue extends EventEmitter {
         file.error = 'Cancelled by user';
       }
     });
+
+    // Stop periodic memory monitoring immediately
+    const timer = this.memoryMonitoringTimers.get(jobId);
+    if (timer) {
+      stopPeriodicLogging(timer);
+      this.memoryMonitoringTimers.delete(jobId);
+    }
 
     this.updateJob(jobId);
     return true;

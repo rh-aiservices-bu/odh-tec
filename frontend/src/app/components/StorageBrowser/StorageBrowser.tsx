@@ -1,12 +1,12 @@
 import config from '@app/config';
-import { faDownload, faEye, faFile, faFolder, faTrash } from '@fortawesome/free-solid-svg-icons';
-import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
+import { base64Encode, base64Decode } from '@app/utils/encoding';
 import {
   Alert,
   Breadcrumb,
   BreadcrumbItem,
   Button,
   Card,
+  Checkbox,
   DropEvent,
   FileUpload,
   Flex,
@@ -35,24 +35,35 @@ import {
   ToolbarGroup,
   ToolbarItem,
   Tooltip,
+  ModalHeader,
+  ModalFooter,
+  ModalBody,
+  Modal,
 } from '@patternfly/react-core';
-import { Modal } from '@patternfly/react-core/deprecated';
-import { SearchIcon, CopyIcon } from '@patternfly/react-icons';
-import UploadIcon from '@patternfly/react-icons/dist/esm/icons/upload-icon';
-import TrashIcon from '@patternfly/react-icons/dist/esm/icons/trash-icon';
+import {
+  SearchIcon,
+  CopyIcon,
+  DownloadIcon,
+  EyeIcon,
+  FileIcon,
+  FolderIcon,
+  TrashIcon,
+  UploadIcon,
+} from '@patternfly/react-icons';
 import { Table, Tbody, Td, Th, Thead, Tr } from '@patternfly/react-table';
 import axios from 'axios';
 import * as React from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import Emitter from '../../utils/emitter';
 import DocumentRenderer from '../DocumentRenderer/DocumentRenderer';
-import { ObjectRow, PrefixRow, UploadedFile, ExtendedFile } from './storageBrowserTypes';
+import { UploadedFile, ExtendedFile } from './storageBrowserTypes';
 import HfLogo from '@app/assets/bgimages/hf-logo.svg';
 import pLimit from 'p-limit';
 import { storageService, StorageLocation, FileEntry } from '@app/services/storageService';
 import { TransferAction } from '@app/components/Transfer';
+import { formatBytes } from '@app/utils/format';
 
-interface StorageBrowserProps {}
+interface StorageBrowserProps { }
 
 const StorageBrowser: React.FC<StorageBrowserProps> = () => {
   /*
@@ -92,6 +103,7 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
 
   // Limit the number of concurrent file uploads or transfers
   const [maxConcurrentTransfers, setMaxConcurrentTransfers] = React.useState(2);
+  const [maxFilesPerPage, setMaxFilesPerPage] = React.useState(100);
 
   React.useEffect(() => {
     axios
@@ -114,19 +126,45 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
       });
   }, []);
 
-  // URL parameters
+  React.useEffect(() => {
+    axios
+      .get(`${config.backend_api_url}/settings/max-files-per-page`)
+      .then((response) => {
+        const { maxFilesPerPage } = response.data;
+        if (maxFilesPerPage !== undefined) {
+          setMaxFilesPerPage(maxFilesPerPage);
+        }
+      })
+      .catch((error) => {
+        console.error(error);
+        // Fall back to default value
+        setMaxFilesPerPage(100);
+        Emitter.emit('notification', {
+          variant: 'warning',
+          title: 'Using Default Settings',
+          description: 'Failed to fetch max files per page setting. Using default value (100).',
+        });
+      });
+  }, []);
+
+  // URL parameters from /browse/:locationId/:path?
+  //
+  // ENCODING STRATEGY (see docs/architecture/frontend-architecture.md):
+  // - locationId: NOT encoded (validated to URL-safe [a-z0-9-] on backend)
+  // - path: Base64-encoded (can contain slashes, spaces, special chars)
   const { locationId, path: encodedPath } = useParams<{
     locationId?: string;
     path?: string;
   }>();
 
   // Decode base64-encoded path from URL
-  // Path is base64-encoded in URL to handle slashes and special characters
-  // storageService will re-encode it for local storage API calls
+  // Path is base64-encoded in URL to handle slashes and special characters safely
+  // Note: locationId is NOT decoded - it's already URL-safe by validation
+  // storageService will re-encode paths for local storage API calls
   const path = React.useMemo(() => {
     if (!encodedPath) return '';
     try {
-      return atob(encodedPath);
+      return base64Decode(encodedPath);
     } catch (error) {
       console.error('[StorageBrowser] Failed to decode path from URL:', encodedPath, error);
       return '';
@@ -323,15 +361,6 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
   const [deepSearchPagesScanned, setDeepSearchPagesScanned] = React.useState<number>(0);
   const [deepSearchCancelled, setDeepSearchCancelled] = React.useState<boolean>(false);
 
-  // Helper function to format bytes to human-readable size
-  const formatBytes = (bytes: number): string => {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
-  };
-
   // Unified file refresh function - replaces refreshObjects
   const refreshFiles = React.useCallback(
     async (
@@ -361,7 +390,7 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
           // S3: Use continuation token pagination
           response = await storageService.listFiles(location.id, path, {
             continuationToken: continuationToken || undefined,
-            maxKeys: searchParams ? undefined : 1000,
+            maxKeys: searchParams ? undefined : maxFilesPerPage,
             q: searchParams?.q,
             mode: searchParams?.mode,
           });
@@ -374,7 +403,7 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
           const offset = appendResults ? paginationOffset : 0;
 
           response = await storageService.listFiles(location.id, path, {
-            limit: 1000,
+            limit: maxFilesPerPage,
             offset,
             q: searchParams?.q,
             mode: searchParams?.mode,
@@ -431,8 +460,8 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
         setFiles([]);
       }
     },
-    [paginationOffset],
-  ); // Dependencies: only paginationOffset (others are setters)
+    [paginationOffset, maxFilesPerPage],
+  ); // Dependencies: paginationOffset and maxFilesPerPage
 
   // Load files when location or path changes
   React.useEffect(() => {
@@ -470,7 +499,8 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
       serverSearchActive ? { q: searchObjectText, mode: searchMode } : undefined,
       abortControllerRef.current || undefined,
     );
-  }, [selectedLocation, path, refreshFiles]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedLocation, path]);
 
   React.useEffect(() => {
     // On short searches (<3) just local filter; if we were previously server searching, reload unfiltered list.
@@ -533,6 +563,38 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
       dir.name.toLowerCase().includes(searchObjectText.toLowerCase()) ||
       dir.path.toLowerCase().includes(searchObjectText.toLowerCase()),
   );
+
+  /*
+      Multi-select state and handlers
+    */
+  const [selectedItems, setSelectedItems] = React.useState<Set<string>>(new Set());
+  const [lastSelected, setLastSelected] = React.useState<string | null>(null);
+
+  // Clear selection on navigation
+  React.useEffect(() => {
+    setSelectedItems(new Set());
+    setLastSelected(null);
+  }, [currentPath, locationId]);
+
+  // Create item map for efficient selection count calculation (O(1) lookup vs O(n²))
+  const itemMap = React.useMemo(() => {
+    const map = new Map<string, FileEntry>();
+    filteredDirectories.forEach((item) => map.set(item.path, item));
+    filteredFiles.forEach((item) => map.set(item.path, item));
+    return map;
+  }, [filteredDirectories, filteredFiles]);
+
+  // Calculate selection counts efficiently using the item map
+  const { selectedFileCount, selectedFolderCount } = React.useMemo(() => {
+    let files = 0,
+      folders = 0;
+    selectedItems.forEach((itemPath) => {
+      const item = itemMap.get(itemPath);
+      if (item?.type === 'directory') folders++;
+      else if (item?.type === 'file') files++;
+    });
+    return { selectedFileCount: files, selectedFolderCount: folders };
+  }, [selectedItems, itemMap]);
 
   // Auto-trigger deep search for client-side searches when no matches found
   React.useEffect(() => {
@@ -601,25 +663,17 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
     setSearchObjectText('');
 
     // Navigate
-    navigate(newPath !== '' ? `/browse/${locationId}/${btoa(newPath)}` : `/browse/${locationId}`);
+    navigate(newPath !== '' ? `/browse/${locationId}/${base64Encode(newPath)}` : `/browse/${locationId}`);
   };
-
-  /*
-      Multi-select state and handlers
-    */
-  const [selectedItems, setSelectedItems] = React.useState<Set<string>>(new Set());
-  const [lastSelected, setLastSelected] = React.useState<string | null>(null);
-
-  // Clear selection on navigation
-  React.useEffect(() => {
-    setSelectedItems(new Set());
-    setLastSelected(null);
-  }, [currentPath, locationId]);
 
   // Select all visible items
   const handleSelectAll = (isSelecting: boolean) => {
     if (isSelecting) {
-      setSelectedItems(new Set(filteredFiles.map((f) => f.path)));
+      const allVisibleItems = new Set([
+        ...filteredFiles.map((f) => f.path),
+        ...filteredDirectories.map((d) => d.path)
+      ]);
+      setSelectedItems(allVisibleItems);
     } else {
       setSelectedItems(new Set());
     }
@@ -644,8 +698,11 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
       return;
     }
 
-    const lastIndex = filteredFiles.findIndex((f) => f.path === lastSelected);
-    const currentIndex = filteredFiles.findIndex((f) => f.path === path);
+    // Combine filtered directories and files for range selection
+    const allFilteredItems = [...filteredDirectories, ...filteredFiles];
+
+    const lastIndex = allFilteredItems.findIndex((f) => f.path === lastSelected);
+    const currentIndex = allFilteredItems.findIndex((f) => f.path === path);
 
     if (lastIndex === -1 || currentIndex === -1) return;
 
@@ -654,7 +711,7 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
 
     const updated = new Set(selectedItems);
     for (let i = start; i <= end; i++) {
-      updated.add(filteredFiles[i].path);
+      updated.add(allFilteredItems[i].path);
     }
 
     setSelectedItems(updated);
@@ -679,10 +736,14 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [filteredFiles]);
 
-  // Bulk delete selected items
-  const handleDeleteSelected = async () => {
-    if (!confirm(`Delete ${selectedItems.size} items?`)) return;
+  // Bulk delete selected items - open confirmation modal
+  const handleDeleteSelected = () => {
+    setIsDeleteSelectedModalOpen(true);
+  };
 
+  // Bulk delete confirmation - actual deletion logic
+  const handleDeleteSelectedConfirm = async () => {
+    setIsDeletingSelected(true);
     try {
       await Promise.all(Array.from(selectedItems).map((path) => storageService.deleteFile(locationId!, path)));
 
@@ -701,9 +762,11 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
 
       Emitter.emit('notification', {
         variant: 'success',
-        title: 'Files deleted',
+        title: 'Delete Successful',
         description: `Successfully deleted ${selectedItems.size} items.`,
       });
+
+      setIsDeleteSelectedModalOpen(false);
     } catch (error) {
       console.error('Failed to delete selected items:', error);
       Emitter.emit('notification', {
@@ -711,6 +774,8 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
         title: 'Delete Failed',
         description: 'Failed to delete some items. Please try again.',
       });
+    } finally {
+      setIsDeletingSelected(false);
     }
   };
 
@@ -780,7 +845,7 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
   const handleObjectViewClick = (key: string) => async (event: React.MouseEvent<HTMLButtonElement>) => {
     // Retrieve the object from the backend and open the File Viewer modal
     await axios
-      .get(`${config.backend_api_url}/objects/view/${locationId}/${btoa(key)}`, { responseType: 'arraybuffer' })
+      .get(`${config.backend_api_url}/objects/view/${locationId}/${base64Encode(key)}`, { responseType: 'arraybuffer' })
       .then((response) => {
         setFileName(key.split('/').pop() || '');
         const binary = new Uint8Array(response.data);
@@ -801,7 +866,7 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
   const handleLocalFileViewClick = (filePath: string) => async (event: React.MouseEvent<HTMLButtonElement>) => {
     // Retrieve the local file from the backend and open the File Viewer modal
     await axios
-      .get(`${config.backend_api_url}/local/view/${locationId}/${btoa(filePath)}`, { responseType: 'arraybuffer' })
+      .get(`${config.backend_api_url}/local/view/${locationId}/${base64Encode(filePath)}`, { responseType: 'arraybuffer' })
       .then((response) => {
         setFileName(filePath.split('/').pop() || '');
         const binary = new Uint8Array(response.data);
@@ -831,8 +896,8 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
     // Build download URL based on storage type
     const downloadUrl =
       selectedLocation.type === 's3'
-        ? `${config.backend_api_url}/objects/download/${locationId}/${btoa(file.path)}`
-        : `${config.backend_api_url}/local/download/${locationId}/${btoa(file.path)}`;
+        ? `${config.backend_api_url}/objects/download/${locationId}/${base64Encode(file.path)}`
+        : `${config.backend_api_url}/local/download/${locationId}/${base64Encode(file.path)}`;
 
     // Use hidden link to trigger download without page navigation
     const link = document.createElement('a');
@@ -958,7 +1023,7 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
     }));
 
     // Upload to storage progress feedback (backend-side progress)
-    const eventSource = new EventSource(`${config.backend_api_url}/objects/upload-progress/${btoa(fullPath)}`);
+    const eventSource = new EventSource(`${config.backend_api_url}/objects/upload-progress/${base64Encode(fullPath)}`);
     singleFileEventSource.current = eventSource;
 
     eventSource.onmessage = (event) => {
@@ -1032,11 +1097,13 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
   const [statusIcon, setStatusIcon] = React.useState('inProgress');
 
   const [isUploadFilesModalOpen, setIsUploadFilesModalOpen] = React.useState(false);
+
   const handleUploadFilesModalToggle = (_event: KeyboardEvent | React.MouseEvent) => {
     setIsUploadFilesModalOpen(!isUploadFilesModalOpen);
   };
 
-  const handleUploadFilesClose = (_event: React.MouseEvent) => {
+  const handleUploadFilesClose = (_event: KeyboardEvent | React.MouseEvent) => {
+    console.log('closing');
     setIsUploadFilesModalOpen(false);
     setCurrentFiles([]);
     setUploadedFiles([]);
@@ -1096,7 +1163,12 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
         description: `${successCount} file(s) uploaded successfully, ${failureCount} failed.`,
       });
     }
-  }, [uploadedFiles, currentFiles, isUploadFilesModalOpen]);
+
+    // Refresh file list to show newly uploaded files/folders
+    if (selectedLocation && selectedLocation.available) {
+      refreshFiles(selectedLocation, currentPath, null, false);
+    }
+  }, [uploadedFiles, currentFiles, isUploadFilesModalOpen, selectedLocation, currentPath, refreshFiles]);
 
   // remove files from both state arrays based on their paths
   const removeFiles = (pathsOfFilesToRemove: string[]) => {
@@ -1242,7 +1314,7 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
     const fileSize = fullFile.size;
 
     // Upload to storage progress feedback (backend-side progress)
-    const eventSource = new EventSource(`${config.backend_api_url}/objects/upload-progress/${btoa(fullPath)}`);
+    const eventSource = new EventSource(`${config.backend_api_url}/objects/upload-progress/${base64Encode(fullPath)}`);
     multiFileEventSources.current.set(fullPath, eventSource);
 
     eventSource.onmessage = (event) => {
@@ -1264,25 +1336,7 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
           }
           return prevUploadedFiles;
         });
-        // Optimistic UI update: Add uploaded file to the file list immediately
-        if (selectedLocation && selectedLocation.available) {
-          const newFileEntry: FileEntry = {
-            name: fullFile.name,
-            path: fullPath,
-            type: 'file',
-            size: fullFile.size,
-            modified: new Date(),
-          };
-
-          setFiles((prevFiles) => {
-            // Check if file already exists in the list
-            const fileExists = prevFiles.some((f) => f.path === fullPath);
-            if (!fileExists) {
-              return [...prevFiles, newFileEntry];
-            }
-            return prevFiles;
-          });
-        }
+        // Note: File list will be refreshed after all uploads complete
       }
     };
 
@@ -1310,23 +1364,7 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
             return prevUploadedFiles;
           });
 
-          // Optimistic UI update: Add uploaded file to the file list immediately
-          const newFileEntry: FileEntry = {
-            name: fullFile.name,
-            path: fullPath,
-            type: 'file',
-            size: fullFile.size,
-            modified: new Date(),
-          };
-
-          setFiles((prevFiles) => {
-            // Check if file already exists in the list
-            const fileExists = prevFiles.some((f) => f.path === fullPath);
-            if (!fileExists) {
-              return [...prevFiles, newFileEntry];
-            }
-            return prevFiles;
-          });
+          // Note: File list will be refreshed after all uploads complete
         }
       })
       .catch((error) => {
@@ -1371,6 +1409,16 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
   const [selectedFile, setSelectedFile] = React.useState('');
   const [fileToDelete, setFileToDelete] = React.useState('');
   const [isDeletingFile, setIsDeletingFile] = React.useState(false);
+  const [isDeletingSelected, setIsDeletingSelected] = React.useState(false);
+  const [isDeleteSelectedModalOpen, setIsDeleteSelectedModalOpen] = React.useState(false);
+  const [bulkDeleteConfirmed, setBulkDeleteConfirmed] = React.useState(false);
+
+  // Reset bulk delete confirmation checkbox when modal opens/closes
+  React.useEffect(() => {
+    if (!isDeleteSelectedModalOpen) {
+      setBulkDeleteConfirmed(false);
+    }
+  }, [isDeleteSelectedModalOpen]);
 
   const handleDeleteFileModalToggle = (_event: KeyboardEvent | React.MouseEvent) => {
     setIsDeleteFileModalOpen(!isDeleteFileModalOpen);
@@ -1518,11 +1566,16 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
     setIsCreateFolderModalOpen(!isCreateFolderModalOpen);
   };
 
-  const validateFolderName = (folderName: string): boolean => {
+  const validateFolderName = (folderName: string, storageType?: 's3' | 'local'): boolean => {
     if (folderName === '') {
       return false;
     }
-    const validCharacters = /^[a-zA-Z0-9!.\-_*'()]+$/;
+
+    // Storage-type-specific validation patterns (no spaces allowed in either)
+    const validCharacters = storageType === 's3'
+      ? /^[a-zA-Z0-9!.\-_*'()]+$/  // S3: letters, numbers, and safe special chars
+      : /^[a-zA-Z0-9._-]+$/;        // Local/PVC: only letters, numbers, dots, underscores, hyphens
+
     if (!validCharacters.test(folderName)) {
       return false;
     }
@@ -1531,15 +1584,14 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
 
   React.useEffect(() => {
     if (newFolderName.length > 0) {
-      setNewFolderNameRulesVisibility(!validateFolderName(newFolderName));
+      setNewFolderNameRulesVisibility(!validateFolderName(newFolderName, selectedLocation?.type));
     } else {
       setNewFolderNameRulesVisibility(false);
     }
-  }, [newFolderName]);
+  }, [newFolderName, selectedLocation?.type]);
 
   const handleNewFolderCreate = async () => {
-    if (!validateFolderName(newFolderName)) {
-      alert('Invalid folder name');
+    if (!validateFolderName(newFolderName, selectedLocation?.type)) {
       return;
     }
 
@@ -2217,7 +2269,14 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
                 <ToolbarContent>
                   <ToolbarItem>
                     <Content component={ContentVariants.p}>
-                      {selectedItems.size} item{selectedItems.size > 1 ? 's' : ''} selected
+                      {selectedFileCount > 0 && (
+                        <>{selectedFileCount} file{selectedFileCount !== 1 ? 's' : ''}</>
+                      )}
+                      {selectedFileCount > 0 && selectedFolderCount > 0 && ', '}
+                      {selectedFolderCount > 0 && (
+                        <>{selectedFolderCount} folder{selectedFolderCount !== 1 ? 's' : ''}</>
+                      )}
+                      {' selected'}
                     </Content>
                   </ToolbarItem>
                   <ToolbarItem>
@@ -2226,7 +2285,13 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
                     </Button>
                   </ToolbarItem>
                   <ToolbarItem>
-                    <Button variant="danger" icon={<TrashIcon />} onClick={handleDeleteSelected}>
+                    <Button
+                      variant="danger"
+                      icon={<TrashIcon />}
+                      onClick={handleDeleteSelected}
+                      isLoading={isDeletingSelected}
+                      isDisabled={isDeletingSelected}
+                    >
                       Delete
                     </Button>
                   </ToolbarItem>
@@ -2246,7 +2311,10 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
                       screenReaderText="Select all"
                       select={{
                         onSelect: (_event, isSelecting) => handleSelectAll(isSelecting),
-                        isSelected: selectedItems.size === filteredFiles.length && filteredFiles.length > 0,
+                        isSelected:
+                          selectedItems.size > 0 &&
+                          selectedItems.size === (filteredFiles.length + filteredDirectories.length) &&
+                          (filteredFiles.length + filteredDirectories.length) > 0,
                       }}
                     />
                     <Th width={30}>{columnNames.key}</Th>
@@ -2257,11 +2325,26 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
                 </Thead>
                 <Tbody>
                   {filteredDirectories.map((dir, rowIndex) => (
-                    <Tr key={dir.path} className="bucket-row">
-                      <Td />
+                    <Tr
+                      key={dir.path}
+                      className="bucket-row"
+                      isRowSelected={selectedItems.has(dir.path)}
+                      onRowClick={(event) => {
+                        if (event?.shiftKey) {
+                          handleShiftClick(dir.path);
+                        }
+                      }}
+                    >
+                      <Td
+                        select={{
+                          rowIndex: rowIndex,
+                          onSelect: (_event, isSelecting) => handleSelectRow(dir.path, isSelecting),
+                          isSelected: selectedItems.has(dir.path),
+                        }}
+                      />
                       <Td className="bucket-column">
                         <Button variant="link" onClick={handlePathClick(dir.path)} className="button-folder-link">
-                          <FontAwesomeIcon icon={faFolder} className="folder-icon" />
+                          <FolderIcon className="folder-icon" />
                           {dir.name}
                         </Button>
                       </Td>
@@ -2273,7 +2356,7 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
                           className="button-file-control"
                           onClick={handleDeleteFolderClick(dir.path)}
                         >
-                          <FontAwesomeIcon icon={faTrash} />
+                          <TrashIcon />
                         </Button>
                       </Td>
                     </Tr>
@@ -2299,7 +2382,7 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
                         }}
                       />
                       <Td className="bucket-column">
-                        <FontAwesomeIcon icon={faFile} className="file-icon" />
+                        <FileIcon className="file-icon" />
                         {file.name}
                       </Td>
                       <Td className="bucket-column">
@@ -2325,7 +2408,7 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
                                       : handleObjectViewClick(file.path)
                                   }
                                 >
-                                  <FontAwesomeIcon icon={faEye} />
+                                  <EyeIcon />
                                 </Button>
                               </Tooltip>
                             </ToolbarItem>
@@ -2336,7 +2419,7 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
                                   className="button-file-control"
                                   onClick={() => handleFileDownload(file)}
                                 >
-                                  <FontAwesomeIcon icon={faDownload} />
+                                  <DownloadIcon />
                                 </Button>
                               </Tooltip>
                             </ToolbarItem>
@@ -2348,7 +2431,7 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
                                   className="button-file-control"
                                   onClick={handleDeleteFileClick(file.path)}
                                 >
-                                  <FontAwesomeIcon icon={faTrash} />
+                                  <TrashIcon />
                                 </Button>
                               </Tooltip>
                             </ToolbarItem>
@@ -2429,26 +2512,52 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
         </Flex>
       </PageSection>
       <Modal
-        title="File Preview"
         isOpen={isFileViewerOpen}
         onClose={handleFileViewerToggle}
-        actions={[
-          <Button key="close" variant="primary" onClick={handleFileViewerToggle}>
-            Close
-          </Button>,
-        ]}
         ouiaId="file-viewer-modal"
         className="file-viewer-modal"
       >
-        <DocumentRenderer fileData={fileData} fileName={fileName} />
+        <ModalHeader title="File Preview" />
+        <ModalBody>
+          <div className="file-viewer-wrapper">
+            <DocumentRenderer fileData={fileData} fileName={fileName} />
+          </div>
+        </ModalBody>
+        <ModalFooter>
+          <Button key="close" variant="primary" onClick={handleFileViewerToggle}>
+            Close
+          </Button>
+        </ModalFooter>
       </Modal>
       <Modal
-        title={'Delete file?'}
-        titleIconVariant="warning"
-        className="bucket-modal"
+        className="standard-modal"
         isOpen={isDeleteFileModalOpen}
         onClose={handleDeleteFileModalToggle}
-        actions={[
+      >
+        <ModalHeader title="Delete file?" titleIconVariant="warning" />
+        <ModalBody>
+          <Content>
+            <Content component={ContentVariants.p}>This action cannot be undone.</Content>
+            <Content component={ContentVariants.p}>
+              Type <strong>{selectedFile.split('/').pop()}</strong> to confirm deletion.
+            </Content>
+          </Content>
+          <TextInput
+            id="delete-modal-input"
+            aria-label="Delete modal input"
+            value={fileToDelete}
+            onChange={(_event, fileToDelete) => setFileToDelete(fileToDelete)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                if (validateFileToDelete()) {
+                  handleDeleteFileConfirm();
+                }
+              }
+            }}
+          />
+        </ModalBody>
+        <ModalFooter>
           <Button
             key="confirm"
             variant="danger"
@@ -2457,40 +2566,41 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
             isLoading={isDeletingFile}
           >
             Delete file
-          </Button>,
+          </Button>
           <Button key="cancel" variant="secondary" onClick={handleDeleteFileCancel}>
             Cancel
-          </Button>,
-        ]}
-      >
-        <Content>
-          <Content component={ContentVariants.p}>This action cannot be undone.</Content>
-          <Content component={ContentVariants.p}>
-            Type <strong>{selectedFile.split('/').pop()}</strong> to confirm deletion.
-          </Content>
-        </Content>
-        <TextInput
-          id="delete-modal-input"
-          aria-label="Delete modal input"
-          value={fileToDelete}
-          onChange={(_event, fileToDelete) => setFileToDelete(fileToDelete)}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') {
-              event.preventDefault();
-              if (validateFileToDelete()) {
-                handleDeleteFileConfirm();
-              }
-            }
-          }}
-        />
+          </Button>
+        </ModalFooter>
       </Modal>
       <Modal
-        title="Delete folder and all its content?"
-        titleIconVariant="warning"
-        className="bucket-modal"
+        className="standard-modal"
         isOpen={isDeleteFolderModalOpen}
         onClose={handleDeleteFolderModalToggle}
-        actions={[
+      >
+        <ModalHeader title="Delete folder and all its content?" titleIconVariant="warning" />
+        <ModalBody>
+          <Content>
+            <Content component={ContentVariants.p}>This action cannot be undone.</Content>
+            <Content component={ContentVariants.p}>
+              Type <strong>{selectedFolder.replace(/\/$/, '').split('/').pop()}</strong> to confirm deletion.
+            </Content>
+          </Content>
+          <TextInput
+            id="delete-folder-modal-input"
+            aria-label="Delete folder modal input"
+            value={folderToDelete}
+            onChange={(_event, folderToDelete) => setFolderToDelete(folderToDelete)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                if (validateFolderToDelete()) {
+                  handleDeleteFolderConfirm();
+                }
+              }
+            }}
+          />
+        </ModalBody>
+        <ModalFooter>
           <Button
             key="confirm"
             variant="danger"
@@ -2499,39 +2609,104 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
             isLoading={isDeletingFolder}
           >
             Delete folder
-          </Button>,
+          </Button>
           <Button key="cancel" variant="secondary" onClick={handleDeleteFolderCancel}>
             Cancel
-          </Button>,
-        ]}
-      >
-        <Content>
-          <Content component={ContentVariants.p}>This action cannot be undone.</Content>
-          <Content component={ContentVariants.p}>
-            Type <strong>{selectedFolder.replace(/\/$/, '').split('/').pop()}</strong> to confirm deletion.
-          </Content>
-        </Content>
-        <TextInput
-          id="delete-folder-modal-input"
-          aria-label="Delete folder modal input"
-          value={folderToDelete}
-          onChange={(_event, folderToDelete) => setFolderToDelete(folderToDelete)}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') {
-              event.preventDefault();
-              if (validateFolderToDelete()) {
-                handleDeleteFolderConfirm();
-              }
-            }
-          }}
-        />
+          </Button>
+        </ModalFooter>
       </Modal>
       <Modal
-        title="Create a new folder"
-        className="bucket-modal"
+        className="standard-modal"
+        isOpen={isDeleteSelectedModalOpen}
+        onClose={() => setIsDeleteSelectedModalOpen(false)}
+      >
+        <ModalHeader title="Delete selected items?" titleIconVariant="warning" />
+        <ModalBody>
+          <p>
+            Are you sure you want to delete {selectedItems.size} item{selectedItems.size !== 1 ? 's' : ''}? This action cannot be undone.
+          </p>
+          <Checkbox
+            id="bulk-delete-confirm"
+            label="I understand this action cannot be undone"
+            isChecked={bulkDeleteConfirmed}
+            onChange={(_event, checked) => setBulkDeleteConfirmed(checked)}
+          />
+        </ModalBody>
+        <ModalFooter>
+          <Button
+            key="confirm"
+            variant="danger"
+            onClick={handleDeleteSelectedConfirm}
+            isLoading={isDeletingSelected}
+            isDisabled={!bulkDeleteConfirmed || isDeletingSelected}
+          >
+            Delete {selectedItems.size} item{selectedItems.size !== 1 ? 's' : ''}
+          </Button>
+          <Button key="cancel" variant="secondary" onClick={() => setIsDeleteSelectedModalOpen(false)}>
+            Cancel
+          </Button>
+        </ModalFooter>
+      </Modal>
+      <Modal
+        className="standard-modal"
         isOpen={isCreateFolderModalOpen}
         onClose={handleCreateFolderModalToggle}
-        actions={[
+        ouiaId="CreateFolderModal"
+      >
+        <ModalHeader title="Create a new folder" />
+        <ModalBody>
+          <Form
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (newFolderName.length > 0 && !newFolderNameRulesVisibility) {
+                handleNewFolderCreate();
+              }
+            }}
+          >
+            <FormGroup label="Folder name" isRequired fieldId="folder-name">
+              <TextInput
+                isRequired
+                type="text"
+                id="folder-name"
+                name="folder-name"
+                aria-describedby="folder-name-helper"
+                placeholder="Enter at least 1 character"
+                value={newFolderName}
+                onChange={(_event, newFolderName) => setNewFolderName(newFolderName)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    if (newFolderName.length > 0 && !newFolderNameRulesVisibility) {
+                      handleNewFolderCreate();
+                    }
+                  }
+                }}
+              />
+            </FormGroup>
+          </Form>
+          <Content hidden={!newFolderNameRulesVisibility}>
+            <Content component={ContentVariants.small} className="bucket-name-rules">
+              Folder names must:
+              <ul>
+                <li>be unique</li>
+                {selectedLocation?.type === 's3' ? (
+                  <li>
+                    only contain letters (a-z, A-Z), numbers (0-9), and these special characters: ! . - _ * ' ( )
+                    <br />
+                    Spaces are not allowed
+                  </li>
+                ) : (
+                  <li>
+                    only contain letters (a-z, A-Z), numbers (0-9), dots (.), underscores (_), and hyphens (-)
+                    <br />
+                    Spaces and special characters are not allowed
+                  </li>
+                )}
+              </ul>
+            </Content>
+          </Content>
+        </ModalBody>
+        <ModalFooter>
           <Button
             key="create"
             variant="primary"
@@ -2539,252 +2714,232 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
             isDisabled={newFolderName.length < 1 || newFolderNameRulesVisibility}
           >
             Create
-          </Button>,
+          </Button>
           <Button key="cancel" variant="link" onClick={handleNewFolderCancel}>
             Cancel
-          </Button>,
-        ]}
-        ouiaId="CreateFolderModal"
-      >
-        <Form
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (newFolderName.length > 0 && !newFolderNameRulesVisibility) {
-              handleNewFolderCreate();
-            }
-          }}
-        >
-          <FormGroup label="Folder name" isRequired fieldId="folder-name">
-            <TextInput
-              isRequired
-              type="text"
-              id="folder-name"
-              name="folder-name"
-              aria-describedby="folder-name-helper"
-              placeholder="Enter at least 1 character"
-              value={newFolderName}
-              onChange={(_event, newFolderName) => setNewFolderName(newFolderName)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  event.preventDefault();
-                  if (newFolderName.length > 0 && !newFolderNameRulesVisibility) {
-                    handleNewFolderCreate();
-                  }
-                }
-              }}
-            />
-          </FormGroup>
-        </Form>
-        <Content hidden={!newFolderNameRulesVisibility}>
-          <Content component={ContentVariants.small} className="bucket-name-rules">
-            Folder names must:
-            <ul>
-              <li>be unique,</li>
-              <li>only contain lowercase letters, numbers and hyphens,</li>
-            </ul>
-          </Content>
-        </Content>
+          </Button>
+        </ModalFooter>
       </Modal>
       <Modal
-        title="Import a model from Hugging Face"
-        className="bucket-modal"
+        className="standard-modal"
         isOpen={isImportModelModalOpen}
         onClose={handleImportModelModalToggle}
-        actions={(() => {
-          console.log('[HF Import Modal] currentImportJobId:', currentImportJobId);
-          const actions = [
-            <Button
-              key="import"
-              variant="primary"
-              onClick={handleImportModelConfirm}
-              isDisabled={!isHfFormValid() || currentImportJobId !== null}
-            >
-              Import
-            </Button>,
-            currentImportJobId !== null && (
-              <Button key="cancel-import" variant="danger" onClick={handleCancelImport}>
-                Cancel Import
-              </Button>
-            ),
-            <Button key="close" variant="link" onClick={handleImportModelClose}>
-              Close
-            </Button>,
-          ].filter(Boolean);
-          console.log('[HF Import Modal] Actions after filter:', actions.length);
-          return actions;
-        })()}
         ouiaId="ImportModelModal"
       >
-        <Form
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (isHfFormValid()) {
-              handleImportModelConfirm(event as unknown as React.MouseEvent);
-            }
-          }}
-        >
-          <FormGroup label="Model ID" isRequired fieldId="model-name">
-            <TextInput
-              isRequired
-              type="text"
-              id="model-name"
-              name="model-name"
-              aria-describedby="model-name-helper"
-              placeholder="e.g., meta-llama/Llama-2-7b-hf"
-              value={modelName}
-              onChange={(_event, modelName) => setModelName(modelName)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  event.preventDefault();
-                  if (isHfFormValid()) {
-                    handleImportModelConfirm(event as unknown as React.MouseEvent);
+        <ModalHeader title="Import a model from Hugging Face" />
+        <ModalBody>
+          <Form
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (isHfFormValid()) {
+                handleImportModelConfirm(event as unknown as React.MouseEvent);
+              }
+            }}
+          >
+            <FormGroup label="Model ID" isRequired fieldId="model-name">
+              <TextInput
+                isRequired
+                type="text"
+                id="model-name"
+                name="model-name"
+                aria-describedby="model-name-helper"
+                placeholder="e.g., meta-llama/Llama-2-7b-hf"
+                value={modelName}
+                onChange={(_event, modelName) => setModelName(modelName)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    if (isHfFormValid()) {
+                      handleImportModelConfirm(event as unknown as React.MouseEvent);
+                    }
                   }
-                }
-              }}
-            />
-            <FormHelperText>
-              <HelperText>
-                <HelperTextItem>
-                  Enter the HuggingFace model repository ID. Model will be imported to the current location.
-                </HelperTextItem>
-              </HelperText>
-            </FormHelperText>
-          </FormGroup>
-        </Form>
-        <Flex direction={{ default: 'column' }} className="upload-bars">
-          {modelFiles.map((file) => (
-            <FlexItem key={file}>
+                }}
+              />
+              <FormHelperText>
+                <HelperText>
+                  <HelperTextItem>
+                    Enter the HuggingFace model repository ID. Model will be imported to the current location.
+                  </HelperTextItem>
+                </HelperText>
+              </FormHelperText>
+            </FormGroup>
+          </Form>
+          <Flex direction={{ default: 'column' }} className="upload-bars">
+            {modelFiles.map((file) => (
+              <FlexItem key={file}>
+                <Progress
+                  value={uploadToS3Percentages[file]?.loaded ?? 0}
+                  title={`${file} - ${uploadToS3Percentages[file]?.status ?? ''}`}
+                  measureLocation="outside"
+                  variant={uploadToS3Percentages[file]?.status === 'completed' ? 'success' : undefined}
+                  size={ProgressSize.sm}
+                />
+              </FlexItem>
+            ))}
+          </Flex>
+        </ModalBody>
+        <ModalFooter>
+          <Button
+            key="import"
+            variant="primary"
+            onClick={handleImportModelConfirm}
+            isDisabled={!isHfFormValid() || currentImportJobId !== null}
+          >
+            Import
+          </Button>
+          {currentImportJobId !== null && (
+            <Button key="cancel-import" variant="danger" onClick={handleCancelImport}>
+              Cancel Import
+            </Button>
+          )}
+          <Button key="close" variant="link" onClick={handleImportModelClose}>
+            Close
+          </Button>
+        </ModalFooter>
+      </Modal>
+      <Modal
+        className="standard-modal"
+        isOpen={isUploadSingleFileModalOpen}
+        onClose={handleUploadSingleFileModalToggle}
+      >
+        <ModalHeader title="Upload file" />
+        <ModalBody>
+          <FileUpload
+            id="simple-file"
+            value={singleFileUploadValue}
+            filename={singleFilename}
+            filenamePlaceholder="Drag and drop a file or upload one"
+            onFileInputChange={handleFileInputChange}
+            onClearClick={handleClear}
+            browseButtonText="Browse"
+          />
+          <Flex direction={{ default: 'column' }} className="upload-bars">
+            <FlexItem hidden={!(uploadPercentages[singleFilename] && uploadPercentages[singleFilename].loaded !== 0)}>
               <Progress
-                value={uploadToS3Percentages[file]?.loaded ?? 0}
-                title={`${file} - ${uploadToS3Percentages[file]?.status ?? ''}`}
-                measureLocation="outside"
-                variant={uploadToS3Percentages[file]?.status === 'completed' ? 'success' : undefined}
+                value={uploadPercentages[singleFilename]?.loaded ?? 0}
+                title="Upload to backend progress"
                 size={ProgressSize.sm}
               />
             </FlexItem>
-          ))}
-        </Flex>
-      </Modal>
-      <Modal
-        title={'Upload file'}
-        className="bucket-modal"
-        isOpen={isUploadSingleFileModalOpen}
-        onClose={handleUploadSingleFileModalToggle}
-        actions={[
+            <FlexItem
+              hidden={!(uploadToS3Percentages[singleFilename] && uploadToS3Percentages[singleFilename].loaded !== 0)}
+            >
+              <Progress
+                value={uploadToS3Percentages[singleFilename]?.loaded ?? 0}
+                title="Upload to storage progress"
+                size={ProgressSize.sm}
+              />
+            </FlexItem>
+          </Flex>
+        </ModalBody>
+        <ModalFooter>
           <Button key="confirm" variant="primary" onClick={handleUploadFileConfirm} isDisabled={singleFilename === ''}>
             Upload
-          </Button>,
+          </Button>
           <Button key="cancel" variant="link" onClick={handleUploadFileCancel}>
             Cancel
-          </Button>,
-        ]}
-      >
-        <FileUpload
-          id="simple-file"
-          value={singleFileUploadValue}
-          filename={singleFilename}
-          filenamePlaceholder="Drag and drop a file or upload one"
-          onFileInputChange={handleFileInputChange}
-          onClearClick={handleClear}
-          browseButtonText="Browse"
-        />
-        <Flex direction={{ default: 'column' }} className="upload-bars">
-          <FlexItem hidden={!(uploadPercentages[singleFilename] && uploadPercentages[singleFilename].loaded !== 0)}>
-            <Progress
-              value={uploadPercentages[singleFilename]?.loaded ?? 0}
-              title="Upload to backend progress"
-              size={ProgressSize.sm}
-            />
-          </FlexItem>
-          <FlexItem
-            hidden={!(uploadToS3Percentages[singleFilename] && uploadToS3Percentages[singleFilename].loaded !== 0)}
-          >
-            <Progress
-              value={uploadToS3Percentages[singleFilename]?.loaded ?? 0}
-              title="Upload to storage progress"
-              size={ProgressSize.sm}
-            />
-          </FlexItem>
-        </Flex>
+          </Button>
+        </ModalFooter>
       </Modal>
       <Modal
-        title="Upload multiple files"
-        className="bucket-modal"
+        className="standard-modal"
         isOpen={isUploadFilesModalOpen}
-        actions={[
+        onClose={handleUploadFilesClose}
+      >
+        <ModalHeader title="Upload multiple files" />
+        <ModalBody>
+          <MultipleFileUpload onFileDrop={handleFileDrop} isHorizontal={false}>
+            <MultipleFileUploadMain
+              titleIcon={<UploadIcon />}
+              titleText="Drag and drop files here or click on the button to select files and folders."
+            />
+            {showStatus && (
+              <MultipleFileUploadStatus
+                statusToggleText={`${successfullyUploadedFileCount} of ${currentFiles.length} files uploaded`}
+                statusToggleIcon={statusIcon}
+                aria-label="Current uploads"
+              >
+                {currentFiles.map((file) => {
+                  // Calculate progress key for this file (must match handleFileDrop and handleFileUpload logic)
+                  const filePath = file.path.replace(/^\//, '');
+                  const progressKey = currentPath
+                    ? currentPath.endsWith('/')
+                      ? currentPath + filePath
+                      : currentPath + '/' + filePath
+                    : filePath;
+
+                  // For local/PVC storage, use axios progress (uploadPercentages)
+                  // For S3 storage, use SSE progress (uploadToS3Percentages)
+                  const isLocalStorage = selectedLocation?.type === 'local';
+                  const progressData = isLocalStorage
+                    ? uploadPercentages[progressKey]
+                    : uploadToS3Percentages[progressKey];
+
+                  const progressValue = progressData?.loaded ?? 0;
+
+                  // Determine status: use S3 status if available, or infer from uploadedFiles
+                  const s3Status = uploadToS3Percentages[progressKey]?.status;
+                  const uploadedFile = uploadedFiles.find((f) => f.path === file.path);
+                  const inferredStatus =
+                    uploadedFile?.loadResult === 'success'
+                      ? 'completed'
+                      : uploadedFile?.loadResult === 'danger'
+                        ? 'failed'
+                        : progressValue === 100
+                          ? 'completed'
+                          : progressValue > 0
+                            ? 'uploading'
+                            : 'queued';
+                  const status = s3Status || inferredStatus;
+
+                  return (
+                    <MultipleFileUploadStatusItem
+                      file={file}
+                      key={file.path}
+                      fileName={file.path + (status ? ' - ' + status : '')}
+                      onClearClick={() => removeFiles([file.path])}
+                      progressHelperText={createHelperText(file)}
+                      customFileHandler={() => { }}
+                      progressValue={progressValue}
+                      progressVariant={status === 'completed' ? 'success' : undefined}
+                    />
+                  );
+                })}
+              </MultipleFileUploadStatus>
+            )}
+          </MultipleFileUpload>
+        </ModalBody>
+        <ModalFooter>
           <Button key="close" variant="primary" onClick={handleUploadFilesClose}>
             Close
-          </Button>,
-        ]}
-      >
-        <MultipleFileUpload onFileDrop={handleFileDrop} isHorizontal={false}>
-          <MultipleFileUploadMain
-            titleIcon={<UploadIcon />}
-            titleText="Drag and drop files here or click on the button to select files and folders."
-          />
-          {showStatus && (
-            <MultipleFileUploadStatus
-              statusToggleText={`${successfullyUploadedFileCount} of ${currentFiles.length} files uploaded`}
-              statusToggleIcon={statusIcon}
-              aria-label="Current uploads"
-            >
-              {currentFiles.map((file) => {
-                // Calculate progress key for this file (must match handleFileDrop and handleFileUpload logic)
-                const filePath = file.path.replace(/^\//, '');
-                const progressKey = currentPath
-                  ? currentPath.endsWith('/')
-                    ? currentPath + filePath
-                    : currentPath + '/' + filePath
-                  : filePath;
-
-                // For local/PVC storage, use axios progress (uploadPercentages)
-                // For S3 storage, use SSE progress (uploadToS3Percentages)
-                const isLocalStorage = selectedLocation?.type === 'local';
-                const progressData = isLocalStorage
-                  ? uploadPercentages[progressKey]
-                  : uploadToS3Percentages[progressKey];
-
-                const progressValue = progressData?.loaded ?? 0;
-
-                // Determine status: use S3 status if available, or infer from uploadedFiles
-                const s3Status = uploadToS3Percentages[progressKey]?.status;
-                const uploadedFile = uploadedFiles.find((f) => f.path === file.path);
-                const inferredStatus =
-                  uploadedFile?.loadResult === 'success'
-                    ? 'completed'
-                    : uploadedFile?.loadResult === 'danger'
-                      ? 'failed'
-                      : progressValue === 100
-                        ? 'completed'
-                        : progressValue > 0
-                          ? 'uploading'
-                          : 'queued';
-                const status = s3Status || inferredStatus;
-
-                return (
-                  <MultipleFileUploadStatusItem
-                    file={file}
-                    key={file.path}
-                    fileName={file.path + (status ? ' - ' + status : '')}
-                    onClearClick={() => removeFiles([file.path])}
-                    progressHelperText={createHelperText(file)}
-                    customFileHandler={() => {}}
-                    progressValue={progressValue}
-                    progressVariant={status === 'completed' ? 'success' : undefined}
-                  />
-                );
-              })}
-            </MultipleFileUploadStatus>
-          )}
-        </MultipleFileUpload>
+          </Button>
+        </ModalFooter>
       </Modal>
       <Modal
-        title="Import Cancelled - Cleanup Files?"
-        titleIconVariant="warning"
-        className="bucket-modal"
+        className="standard-modal"
         isOpen={showCleanupDialog}
         onClose={() => handleCleanupDecision(false)}
-        actions={[
+        ouiaId="CleanupFilesModal"
+      >
+        <ModalHeader title="Import Cancelled - Cleanup Files?" titleIconVariant="warning" />
+        <ModalBody>
+          <Content>
+            <Content component={ContentVariants.p}>
+              The import has been cancelled. The following files were downloaded:
+            </Content>
+            <ul>
+              {cancelledJobInfo?.files?.map((file: any, index: number) => (
+                <li key={index}>
+                  {file.destinationPath.split('/').pop()} - {file.status}
+                </li>
+              ))}
+            </ul>
+            <Content component={ContentVariants.p}>
+              Do you want to keep these files or delete them?
+            </Content>
+          </Content>
+        </ModalBody>
+        <ModalFooter>
           <Button
             key="delete"
             variant="danger"
@@ -2793,7 +2948,7 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
             isDisabled={isDeletingFiles}
           >
             Delete All Downloaded Files
-          </Button>,
+          </Button>
           <Button
             key="keep"
             variant="primary"
@@ -2801,25 +2956,8 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
             isDisabled={isDeletingFiles}
           >
             Keep Files
-          </Button>,
-        ]}
-        ouiaId="CleanupFilesModal"
-      >
-        <Content>
-          <Content component={ContentVariants.p}>
-            The import has been cancelled. The following files were downloaded:
-          </Content>
-          <ul>
-            {cancelledJobInfo?.files?.map((file: any, index: number) => (
-              <li key={index}>
-                {file.destinationPath.split('/').pop()} - {file.status}
-              </li>
-            ))}
-          </ul>
-          <Content component={ContentVariants.p}>
-            Do you want to keep these files or delete them?
-          </Content>
-        </Content>
+          </Button>
+        </ModalFooter>
       </Modal>
       <TransferAction
         isOpen={isTransferModalOpen}
@@ -2836,6 +2974,7 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
         sourceType={selectedLocation?.type || 's3'}
         sourcePath={currentPath}
         selectedFiles={Array.from(selectedItems)}
+        currentListing={[...directories, ...files]}
       />
     </div>
   );

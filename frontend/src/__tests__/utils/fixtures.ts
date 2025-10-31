@@ -1,42 +1,4 @@
-// TODO: These types will be created in Phase 2.1 (docs/features/tasks/phase-2-1-storage-location-api.md)
-// Once created, replace these placeholder types with imports from the actual location
-// import { StorageLocation, FileEntry, TransferConflict } from '../../app/services/storageService';
-
-/**
- * Placeholder type for StorageLocation
- * Will be replaced with actual type from storageService in Phase 2.1
- */
-type StorageLocation = {
-  id: string;
-  name: string;
-  type: 's3' | 'local';
-  available: boolean;
-  region?: string;
-  path?: string;
-};
-
-/**
- * Placeholder type for FileEntry
- * Will be replaced with actual type from storageService in Phase 2.1
- */
-type FileEntry = {
-  name: string;
-  path: string;
-  type: 'file' | 'directory' | 'symlink';
-  size?: number;
-  modified?: Date;
-  target?: string;
-};
-
-/**
- * Placeholder type for TransferConflict
- * Will be replaced with actual type from storageService in Phase 2.1
- */
-type TransferConflict = {
-  path: string;
-  existingSize: number;
-  existingModified: Date;
-};
+import { StorageLocation, FileEntry, TransferConflict } from '../../app/services/storageService';
 
 /**
  * Mock storage locations for testing

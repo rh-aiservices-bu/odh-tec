@@ -141,6 +141,67 @@ npm run dev
 - **Backend API**: http://localhost:8888/api/\*
 - **Backend serves**: API only (frontend served by webpack-dev-server)
 
+### Testing with URL Path Prefix
+
+**Purpose**: Test path prefix routing locally before deploying behind Gateway API, Ingress, or OpenShift AI workbench.
+
+**Setup**:
+
+1. **Set `NB_PREFIX` in `.env` file**:
+
+```bash
+# In backend/.env or root .env
+NB_PREFIX=/my-app
+```
+
+2. **Start development servers**:
+
+```bash
+npm run dev
+```
+
+3. **Access with prefix**:
+
+**Development URLs with prefix**:
+
+- **Frontend**: http://localhost:9000/my-app/
+- **Backend API**: http://localhost:8888/my-app/api/\*
+- **All routes**: `/my-app/browse`, `/my-app/buckets`, `/my-app/settings`, etc.
+
+**What happens**:
+
+- Webpack dev server opens browser at `http://localhost:9000/my-app/`
+- React Router uses `/my-app` as basename for all routes
+- API calls automatically include prefix: `http://localhost:8888/my-app/api/buckets`
+- Static assets load from `/my-app/main.bundle.js`
+
+**Common use cases**:
+
+- **Testing Gateway API routing**: Set `NB_PREFIX=/my-app` to simulate Gateway HTTPRoute
+- **Testing OpenShift AI deployment**: Set `NB_PREFIX=/notebook/namespace/workbench`
+- **Testing Ingress paths**: Set `NB_PREFIX=/custom-path`
+
+**Troubleshooting**:
+
+**Issue**: Application loads but routes don't work
+
+- **Check**: Browser URL should be `http://localhost:9000/my-app/` (with trailing slash)
+- **Fix**: Navigate to the full URL with prefix and trailing slash
+
+**Issue**: API calls fail with 404
+
+- **Check**: Browser DevTools Network tab shows requests to `/my-app/api/*`
+- **Fix**: Verify `NB_PREFIX` is set in `.env` and backend restarted
+
+**Issue**: Webpack dev server won't open browser
+
+- **Behavior**: With `NB_PREFIX` set, webpack opens at `http://localhost:9000/my-app/`
+- **Note**: This is expected behavior
+
+**To test without prefix**: Remove or comment out `NB_PREFIX` in `.env` and restart
+
+**For more details**, see [Configuration - NB_PREFIX](../deployment/configuration.md#application-configuration)
+
 ### Start Individual Packages
 
 **Backend only**:

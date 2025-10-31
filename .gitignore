@@ -24,3 +24,5 @@ coverage/
 .claude
 
 .serena
+
+*.local

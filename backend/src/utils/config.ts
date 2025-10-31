@@ -3,6 +3,7 @@ import { NodeJsClient } from '@smithy/types';
 import { NodeHttpHandler } from '@aws-sdk/node-http-handler';
 import { HttpProxyAgent } from 'http-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
+import { getApplyMd5BodyChecksumPlugin } from '@aws-sdk/middleware-apply-body-checksum';
 
 // Initial configuration
 let accessKeyId = process.env.AWS_ACCESS_KEY_ID || '';
@@ -12,6 +13,7 @@ let endpoint = process.env.AWS_S3_ENDPOINT || '';
 let defaultBucket = process.env.AWS_S3_BUCKET || '';
 let hfToken = process.env.HF_TOKEN || '';
 let maxConcurrentTransfers = parseInt(process.env.MAX_CONCURRENT_TRANSFERS || '2', 10);
+let maxFilesPerPage = parseInt(process.env.MAX_FILES_PER_PAGE || '100', 10);
 let httpProxy = process.env.HTTP_PROXY || '';
 let httpsProxy = process.env.HTTPS_PROXY || '';
 
@@ -71,7 +73,15 @@ export const initializeS3Client = (): S3Client => {
       ...(agentConfig.httpsAgent && { httpsAgent: agentConfig.httpsAgent }),
     });
   }
-  return new S3Client(s3ClientOptions) as NodeJsClient<S3Client>;
+
+  const client = new S3Client(s3ClientOptions) as NodeJsClient<S3Client>;
+
+  // Apply MD5 checksum middleware for Minio compatibility
+  // Minio requires Content-MD5 header for DELETE operations (both single and bulk)
+  // This middleware automatically adds Content-MD5 to operations that support it
+  client.middlewareStack.use(getApplyMd5BodyChecksumPlugin(client.config));
+
+  return client;
 };
 
 let s3Client = initializeS3Client();
@@ -132,6 +142,14 @@ export const getMaxConcurrentTransfers = (): number => {
 
 export const updateMaxConcurrentTransfers = (newMaxConcurrentTransfers: number): void => {
   maxConcurrentTransfers = newMaxConcurrentTransfers;
+};
+
+export const getMaxFilesPerPage = (): number => {
+  return maxFilesPerPage;
+};
+
+export const updateMaxFilesPerPage = (newMaxFilesPerPage: number): void => {
+  maxFilesPerPage = newMaxFilesPerPage;
 };
 
 /**

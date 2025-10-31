@@ -3,6 +3,7 @@ import { promises as fs, createWriteStream } from 'fs';
 import path from 'path';
 import { pipeline } from 'stream/promises';
 import { Transform } from 'stream';
+import { base64Decode } from '../../../utils/encoding';
 import {
   validatePath,
   getStorageLocations,
@@ -284,7 +285,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
 
     try {
       // Decode base64-encoded path from frontend (consistent with other routes)
-      const relativePath = encodedPath ? atob(encodedPath) : '';
+      const relativePath = encodedPath ? base64Decode(encodedPath) : '';
 
       const absolutePath = await validatePath(locationId, relativePath);
       const { files, totalCount } = await listDirectory(absolutePath, limit, offset);
@@ -343,10 +344,36 @@ export default async (fastify: FastifyInstance): Promise<void> => {
 
     try {
       // Decode base64-encoded path from frontend
-      const relativePath = encodedPath ? atob(encodedPath) : '';
+      const relativePath = encodedPath ? base64Decode(encodedPath) : '';
 
       // For local storage, relativePath is the full file path (including filename)
       // This matches the S3 API behavior where the path specifies the exact destination
+
+      // First, ensure parent directory structure exists (before validation)
+      // This is critical for folder uploads with nested paths like "folderA/subfolderB/file.ext"
+      const parentRelativePath = path.dirname(relativePath);
+
+      if (parentRelativePath && parentRelativePath !== '.') {
+        // Get validated base path
+        const basePath = await validatePath(locationId, '.');
+
+        // Construct parent absolute path
+        const normalizedParent = path.normalize(parentRelativePath);
+        const parentAbsolutePath = path.join(basePath, normalizedParent);
+
+        // Security check: ensure parent doesn't escape base
+        if (
+          !parentAbsolutePath.startsWith(basePath + path.sep) &&
+          parentAbsolutePath !== basePath
+        ) {
+          throw new SecurityError(`Path escapes allowed directory: ${parentRelativePath}`);
+        }
+
+        // Create directory structure recursively
+        await fs.mkdir(parentAbsolutePath, { recursive: true });
+      }
+
+      // Now validate the full file path (will succeed because parent exists)
       const absolutePath = await validatePath(locationId, relativePath);
 
       let data;
@@ -372,10 +399,6 @@ export default async (fastify: FastifyInstance): Promise<void> => {
 
       // Use absolutePath directly as the full file path (not joining with data.filename)
       const filePath = absolutePath;
-
-      // Ensure parent directory exists
-      const parentDir = path.dirname(filePath);
-      await fs.mkdir(parentDir, { recursive: true });
 
       // Check if file exists (conflict detection)
       try {
@@ -409,6 +432,10 @@ export default async (fastify: FastifyInstance): Promise<void> => {
               callback(null, chunk);
             }
           },
+          flush(callback) {
+            // Ensure stream is properly finalized
+            callback();
+          },
         }),
         createWriteStream(filePath),
       );
@@ -435,7 +462,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
 
     try {
       // Decode base64-encoded path from frontend
-      const relativePath = encodedPath ? atob(encodedPath) : '';
+      const relativePath = encodedPath ? base64Decode(encodedPath) : '';
 
       const absolutePath = await validatePath(locationId, relativePath);
       await checkFileSize(absolutePath);
@@ -461,7 +488,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
 
     try {
       // Decode base64-encoded path from frontend
-      const relativePath = encodedPath ? atob(encodedPath) : '';
+      const relativePath = encodedPath ? base64Decode(encodedPath) : '';
 
       const absolutePath = await validatePath(locationId, relativePath);
       await checkFileSize(absolutePath);
@@ -492,7 +519,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
 
     try {
       // Decode base64-encoded path from frontend
-      const relativePath = encodedPath ? atob(encodedPath) : '';
+      const relativePath = encodedPath ? base64Decode(encodedPath) : '';
 
       const absolutePath = await validatePath(locationId, relativePath);
 
@@ -548,7 +575,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
 
     try {
       // Decode base64-encoded path from frontend
-      const relativePath = encodedPath ? atob(encodedPath) : '';
+      const relativePath = encodedPath ? base64Decode(encodedPath) : '';
 
       const absolutePath = await validatePath(locationId, relativePath);
       await createDirectory(absolutePath);

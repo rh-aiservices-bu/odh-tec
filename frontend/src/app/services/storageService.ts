@@ -1,5 +1,6 @@
 import axios from 'axios';
 import config from '@app/config';
+import { base64Encode } from '@app/utils/encoding';
 
 /**
  * Storage type discriminator
@@ -42,6 +43,28 @@ export interface TransferConflict {
 }
 
 /**
+ * Represents an item (file or directory) to be transferred
+ */
+export interface TransferItem {
+  path: string;           // Relative path from source.path
+  type: 'file' | 'directory';
+}
+
+/**
+ * Conflict check response with new fields
+ */
+export interface ConflictCheckResponse {
+  conflicts: string[];
+  nonConflicting: string[];  // Changed to required
+  warning?: {
+    type: 'large_folder';
+    fileCount: number;
+    totalSize: number;
+    message: string;
+  };
+}
+
+/**
  * Transfer request payload
  */
 export interface TransferRequest {
@@ -55,7 +78,7 @@ export interface TransferRequest {
     locationId: string;
     path: string;
   };
-  files: string[];
+  items: TransferItem[];  // CHANGED from 'files: string[]'
   conflictResolution: 'overwrite' | 'skip' | 'rename';
 }
 
@@ -215,7 +238,7 @@ class StorageService {
         // S3 uses continuationToken + maxKeys pagination
         // Prefix must be base64-encoded and in URL path to match backend route
         const url = path
-          ? `${config.backend_api_url}/objects/${locationId}/${btoa(path)}`
+          ? `${config.backend_api_url}/objects/${locationId}/${base64Encode(path)}`
           : `${config.backend_api_url}/objects/${locationId}`;
 
         const response = await axios.get(url, {
@@ -240,7 +263,7 @@ class StorageService {
       } else {
         // Local storage uses limit + offset pagination
         // Local storage requires base64-encoded paths
-        const encodedPath = path ? btoa(path) : '';
+        const encodedPath = path ? base64Encode(path) : '';
         const response = await axios.get(
           `${config.backend_api_url}/local/files/${locationId}/${encodedPath}`,
           {
@@ -298,11 +321,11 @@ class StorageService {
 
       if (location.type === 's3') {
         // S3 requires encoded path to match backend route: /objects/upload/:bucketName/:encodedKey
-        const encodedPath = btoa(path);
+        const encodedPath = base64Encode(path);
         await axios.post(`${config.backend_api_url}/objects/upload/${locationId}/${encodedPath}`, formData, axiosConfig);
       } else {
         // Local storage requires base64-encoded paths
-        const encodedPath = btoa(path);
+        const encodedPath = base64Encode(path);
         await axios.post(`${config.backend_api_url}/local/files/${locationId}/${encodedPath}`, formData, axiosConfig);
       }
     } catch (error) {
@@ -319,8 +342,8 @@ class StorageService {
 
     const url =
       location.type === 's3'
-        ? `${config.backend_api_url}/objects/download/${locationId}/${btoa(path)}`
-        : `${config.backend_api_url}/local/download/${locationId}/${btoa(path)}`;
+        ? `${config.backend_api_url}/objects/download/${locationId}/${base64Encode(path)}`
+        : `${config.backend_api_url}/local/download/${locationId}/${base64Encode(path)}`;
 
     // Trigger browser download
     window.location.href = url;
@@ -335,10 +358,10 @@ class StorageService {
     try {
       if (location.type === 's3') {
         // S3 requires base64-encoded paths
-        await axios.delete(`${config.backend_api_url}/objects/${locationId}/${btoa(path)}`);
+        await axios.delete(`${config.backend_api_url}/objects/${locationId}/${base64Encode(path)}`);
       } else {
         // Local storage requires base64-encoded paths
-        const encodedPath = btoa(path);
+        const encodedPath = base64Encode(path);
         await axios.delete(`${config.backend_api_url}/local/files/${locationId}/${encodedPath}`);
       }
     } catch (error) {
@@ -360,7 +383,7 @@ class StorageService {
         const formData = new FormData();
         const emptyFile = new File([''], '.s3keep');
         formData.append('file', emptyFile);
-        const encodedKey = btoa(`${path}/.s3keep`);
+        const encodedKey = base64Encode(`${path}/.s3keep`);
         await axios.post(
           `${config.backend_api_url}/objects/upload/${locationId}/${encodedKey}`,
           formData,
@@ -368,7 +391,7 @@ class StorageService {
         );
       } else {
         // Local storage requires base64-encoded paths
-        const encodedPath = btoa(path);
+        const encodedPath = base64Encode(path);
         await axios.post(`${config.backend_api_url}/local/directories/${locationId}/${encodedPath}`);
       }
     } catch (error) {
@@ -378,23 +401,43 @@ class StorageService {
   }
 
   /**
-   * Check for conflicting files before transfer
+   * Conflict check response with new fields
    */
   async checkConflicts(
-    destination: { type: StorageType; locationId: string; path: string },
-    files: string[],
-  ): Promise<string[]> {
+    sourceLocationId: string,
+    sourcePath: string,
+    items: TransferItem[],
+    destLocationId: string,
+    destPath: string,
+  ): Promise<ConflictCheckResponse> {
     try {
       const response = await axios.post(`${config.backend_api_url}/transfer/check-conflicts`, {
-        destination,
-        files,
+        source: {
+          type: await this.getStorageType(sourceLocationId),
+          locationId: sourceLocationId,
+          path: sourcePath,
+        },
+        destination: {
+          type: await this.getStorageType(destLocationId),
+          locationId: destLocationId,
+          path: destPath,
+        },
+        items,
       });
 
-      return response.data.conflicts;
+      return response.data;
     } catch (error) {
       console.error('Failed to check conflicts:', error);
       throw error;
     }
+  }
+
+  /**
+   * Helper method to get storage type
+   */
+  private async getStorageType(locationId: string): Promise<StorageType> {
+    const location = await this.getLocation(locationId);
+    return location.type;
   }
 
   /**

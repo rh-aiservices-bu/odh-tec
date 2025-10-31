@@ -1,154 +1,169 @@
 import {
-  Modal,
+  Alert,
+  Button,
   Form,
   FormGroup,
-  FormSelect,
-  FormSelectOption,
-  Alert,
-  DataList,
-  DataListItem,
-  DataListItemRow,
-  DataListItemCells,
-  DataListCell,
+  List,
+  ListItem,
+  Modal,
+  ModalBody,
+  ModalFooter,
+  ModalHeader,
   Radio,
-  Button,
-  ActionGroup,
 } from '@patternfly/react-core';
 import * as React from 'react';
-import { TransferConflict } from '@app/services/storageService';
+import { ExclamationTriangleIcon } from '@patternfly/react-icons';
 
 interface ConflictResolutionModalProps {
   isOpen: boolean;
-  conflicts: TransferConflict[];
-  onResolve: (resolutions: Record<string, 'overwrite' | 'skip' | 'rename'>) => void;
+  conflictingFiles: string[];
+  nonConflictingFiles: string[];
+  onResolve: (resolution: 'overwrite' | 'skip' | 'rename') => void;
   onCancel: () => void;
 }
 
-// Helper functions for formatting
-const formatSize = (bytes?: number): string => {
-  if (!bytes) return 'Unknown size';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let size = bytes;
-  let unitIndex = 0;
-
-  while (size >= 1024 && unitIndex < units.length - 1) {
-    size /= 1024;
-    unitIndex++;
-  }
-
-  return `${size.toFixed(2)} ${units[unitIndex]}`;
-};
-
-const formatDate = (date?: Date): string => {
-  if (!date) return 'Unknown date';
-  return new Date(date).toLocaleString();
-};
-
 export const ConflictResolutionModal: React.FC<ConflictResolutionModalProps> = ({
   isOpen,
-  conflicts,
+  conflictingFiles,
+  nonConflictingFiles,
   onResolve,
   onCancel,
 }) => {
-  const [resolutions, setResolutions] = React.useState<Record<string, string>>({});
-  const [applyToAll, setApplyToAll] = React.useState<string>('');
+  const [resolution, setResolution] = React.useState<'overwrite' | 'skip' | 'rename'>('skip');
 
   const handleResolve = () => {
-    const finalResolutions: Record<string, 'overwrite' | 'skip' | 'rename'> = {};
-
-    conflicts.forEach((conflict) => {
-      const resolution = resolutions[conflict.path] || applyToAll || 'rename';
-      finalResolutions[conflict.path] = resolution as 'overwrite' | 'skip' | 'rename';
-    });
-
-    onResolve(finalResolutions);
+    onResolve(resolution);
   };
 
   return (
-    <Modal title="File Conflicts Detected" isOpen={isOpen} onClose={onCancel} variant="medium">
-      <Alert variant="warning" title={`${conflicts.length} file(s) already exist`} isInline />
+    <Modal
+      isOpen={isOpen}
+      onClose={onCancel}
+      variant="medium"
+    >
+      <ModalHeader title="Resolve File Conflicts" />
+      <ModalBody>
+        {/* Non-conflicting files info */}
+        {nonConflictingFiles.length > 0 && (
+          <Alert
+            variant="info"
+            isInline
+            title="Non-conflicting files"
+            style={{ marginBottom: '1rem' }}
+          >
+            <p>
+              {nonConflictingFiles.length} file{nonConflictingFiles.length !== 1 ? 's' : ''} will be
+              copied automatically (no conflicts).
+            </p>
+          </Alert>
+        )}
 
-      <DataList aria-label="Conflict list">
-        {conflicts.map((conflict) => (
-          <DataListItem key={conflict.path}>
-            <DataListItemRow>
-              <DataListItemCells
-                dataListCells={[
-                  <DataListCell key="info">
-                    <div>
-                      <strong>{conflict.path}</strong>
-                      {conflict.existingSize && (
-                        <small>
-                          <br />
-                          Existing: {formatSize(conflict.existingSize)}, modified{' '}
-                          {formatDate(conflict.existingModified)}
-                        </small>
-                      )}
-                    </div>
-                  </DataListCell>,
-                  <DataListCell key="resolution">
-                    <div>
-                      <Radio
-                        name={`resolution-${conflict.path}`}
-                        id={`${conflict.path}-overwrite`}
-                        value="overwrite"
-                        label="Overwrite"
-                        isChecked={resolutions[conflict.path] === 'overwrite'}
-                        onChange={() =>
-                          setResolutions({ ...resolutions, [conflict.path]: 'overwrite' })
-                        }
-                      />
-                      <Radio
-                        name={`resolution-${conflict.path}`}
-                        id={`${conflict.path}-skip`}
-                        value="skip"
-                        label="Skip"
-                        isChecked={resolutions[conflict.path] === 'skip'}
-                        onChange={() =>
-                          setResolutions({ ...resolutions, [conflict.path]: 'skip' })
-                        }
-                      />
-                      <Radio
-                        name={`resolution-${conflict.path}`}
-                        id={`${conflict.path}-rename`}
-                        value="rename"
-                        label="Keep both (rename)"
-                        isChecked={resolutions[conflict.path] === 'rename'}
-                        onChange={() =>
-                          setResolutions({ ...resolutions, [conflict.path]: 'rename' })
-                        }
-                      />
-                    </div>
-                  </DataListCell>,
-                ]}
-              />
-            </DataListItemRow>
-          </DataListItem>
-        ))}
-      </DataList>
-
-      <FormGroup label="Apply to all">
-        <FormSelect
-          id="apply-to-all-select"
-          aria-label="Apply resolution to all conflicts"
-          value={applyToAll}
-          onChange={(_e, val) => setApplyToAll(val as string)}
+        {/* Conflict info */}
+        <Alert
+          variant="warning"
+          isInline
+          title="Conflicting files"
+          style={{ marginBottom: '1rem' }}
         >
-          <FormSelectOption value="" label="Choose individually" />
-          <FormSelectOption value="overwrite" label="Overwrite all" />
-          <FormSelectOption value="skip" label="Skip all" />
-          <FormSelectOption value="rename" label="Rename all" />
-        </FormSelect>
-      </FormGroup>
+          <p>
+            {conflictingFiles.length} file{conflictingFiles.length !== 1 ? 's' : ''} already exist
+            {conflictingFiles.length === 1 ? 's' : ''} in the destination. How should these be
+            handled?
+          </p>
+        </Alert>
 
-      <ActionGroup>
-        <Button variant="primary" onClick={handleResolve}>
-          Proceed with Transfer
+        {/* Resolution options */}
+        <Form>
+          <FormGroup label="Resolution strategy">
+            <Radio
+              id="skip"
+              name="resolution"
+              label="Skip"
+              description="Skip conflicting files, keep existing destination files"
+              isChecked={resolution === 'skip'}
+              onChange={() => setResolution('skip')}
+            />
+            <Radio
+              id="overwrite"
+              name="resolution"
+              label="Overwrite"
+              description="Replace existing files with source files"
+              isChecked={resolution === 'overwrite'}
+              onChange={() => setResolution('overwrite')}
+            />
+            <Radio
+              id="rename"
+              name="resolution"
+              label="Rename"
+              description="Copy source files with new names (e.g., file.txt → file (1).txt)"
+              isChecked={resolution === 'rename'}
+              onChange={() => setResolution('rename')}
+            />
+          </FormGroup>
+        </Form>
+
+        {/* Conflict list (show first 25) */}
+        {conflictingFiles.length > 0 && (
+          <div style={{ marginTop: '1rem' }}>
+            <h4>Conflicting files:</h4>
+            {conflictingFiles.length > 25 && (
+              <small style={{ color: 'var(--pf-t--global--text--color--subtle)' }}>
+                Showing first 25 of {conflictingFiles.length} conflicts
+              </small>
+            )}
+            <List isPlain>
+              {conflictingFiles.slice(0, 25).map((file) => (
+                <ListItem key={file}>
+                  <ExclamationTriangleIcon
+                    style={{
+                      marginRight: '0.5rem',
+                      color: 'var(--pf-t--global--icon--color--status--warning--default)',
+                    }}
+                  />
+                  {file}
+                </ListItem>
+              ))}
+            </List>
+          </div>
+        )}
+
+        {/* Summary */}
+        <div
+          style={{
+            marginTop: '1rem',
+            padding: '1rem',
+            backgroundColor: 'var(--pf-t--global--background--color--secondary--default)',
+            borderRadius: '4px',
+          }}
+        >
+          <h5>Summary</h5>
+          <p>
+            • {nonConflictingFiles.length} file{nonConflictingFiles.length !== 1 ? 's' : ''} will be
+            copied automatically
+          </p>
+          <p>
+            • {conflictingFiles.length} conflict{conflictingFiles.length !== 1 ? 's' : ''} will be{' '}
+            {resolution === 'skip'
+              ? 'skipped'
+              : resolution === 'overwrite'
+                ? 'overwritten'
+                : 'renamed'}
+          </p>
+          <p>
+            • Total:{' '}
+            {nonConflictingFiles.length + (resolution === 'skip' ? 0 : conflictingFiles.length)} files
+            will be copied
+          </p>
+        </div>
+      </ModalBody>
+      <ModalFooter>
+        <Button key="apply" variant="primary" onClick={handleResolve}>
+          Apply
         </Button>
-        <Button variant="link" onClick={onCancel}>
+        <Button key="cancel" variant="link" onClick={onCancel}>
           Cancel
         </Button>
-      </ActionGroup>
+      </ModalFooter>
     </Modal>
   );
 };

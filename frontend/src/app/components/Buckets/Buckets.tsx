@@ -1,8 +1,6 @@
 import config from '@app/config';
 import * as React from 'react';
 import axios from 'axios';
-import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import { faBucket, faTrash, faFolder } from '@fortawesome/free-solid-svg-icons';
 import {
   Button,
   Card,
@@ -17,10 +15,13 @@ import {
   ContentVariants,
   Label,
   Tooltip,
+  Modal,
+  ModalHeader,
+  ModalBody,
+  ModalFooter,
 } from '@patternfly/react-core';
-import { Modal } from '@patternfly/react-core/deprecated';
 import { Table, Thead, Tr, Th, Tbody, Td, ThProps } from '@patternfly/react-table';
-import { SearchIcon, CloudIcon, FolderIcon, SyncIcon } from '@patternfly/react-icons';
+import { SearchIcon, CloudIcon, DatabaseIcon, FolderIcon, SyncIcon, TrashIcon } from '@patternfly/react-icons';
 import Emitter from '../../utils/emitter';
 import { useNavigate } from 'react-router-dom';
 import { storageService, StorageLocation } from '../../services/storageService';
@@ -491,11 +492,11 @@ const Buckets: React.FunctionComponent = () => {
                     <Button
                       variant="link"
                       onClick={() => {
-                        navigate(`/storage/${row.id}`);
+                        navigate(`/browse/${row.id}`);
                       }}
                       isDisabled={!row.available}
                     >
-                      <FontAwesomeIcon icon={row.type === 's3' ? faBucket : faFolder} />
+                      {row.type === 's3' ? <DatabaseIcon /> : <FolderIcon />}
                       &nbsp;{row.name}
                     </Button>
                   </Td>
@@ -522,7 +523,7 @@ const Buckets: React.FunctionComponent = () => {
                   <Td className="bucket-column align-right">
                     {row.type === 's3' && (
                       <Button variant="danger" onClick={handleDeleteBucketClick(row.name)} isDisabled={!row.available}>
-                        <FontAwesomeIcon icon={faTrash} />
+                        <TrashIcon />
                       </Button>
                     )}
                   </Td>
@@ -533,11 +534,58 @@ const Buckets: React.FunctionComponent = () => {
         </Card>
       </PageSection>
       <Modal
-        title="Create a new bucket"
-        className="bucket-modal"
+        className="standard-modal"
         isOpen={isCreateBucketModalOpen}
         onClose={handleCreateBucketModalToggle}
-        actions={[
+        ouiaId="CreateBucketModal"
+      >
+        <ModalHeader title="Create a new bucket" />
+        <ModalBody>
+          <Form
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (newBucketName.length > 2 && validateBucketName(newBucketName)) {
+                handleNewBucketCreate();
+              }
+            }}
+          >
+            <FormGroup label="Bucket name" isRequired fieldId="bucket-name">
+              <TextInput
+                isRequired
+                type="text"
+                id="bucket-name"
+                name="bucket-name"
+                aria-describedby="bucket-name-helper"
+                placeholder="Enter at least 3 characters"
+                value={newBucketName}
+                onChange={(_event, newBucketName) => setNewBucketName(newBucketName)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    if (newBucketName.length > 2 && validateBucketName(newBucketName)) {
+                      handleNewBucketCreate();
+                    }
+                  }
+                }}
+              />
+            </FormGroup>
+          </Form>
+          <Content hidden={!newBucketNameRulesVisibility}>
+            <Content component={ContentVariants.small} className="bucket-name-rules">
+              Bucket names must:
+              <ul>
+                <li>be unique,</li>
+                <li>be between 3 and 63 characters,</li>
+                <li>start with a lowercase letter or number,</li>
+                <li>only contain lowercase letters, numbers and hyphens,</li>
+                <li>not end with an hyphen,</li>
+                <li>not contain consecutive periods or dashes adjacent to periods,</li>
+                <li>not be formatted as an IP address.</li>
+              </ul>
+            </Content>
+          </Content>
+        </ModalBody>
+        <ModalFooter>
           <Button
             key="create"
             variant="primary"
@@ -545,64 +593,41 @@ const Buckets: React.FunctionComponent = () => {
             isDisabled={newBucketName.length < 3 || newBucketNameRulesVisibility}
           >
             Create
-          </Button>,
+          </Button>
           <Button key="cancel" variant="link" onClick={handleNewBucketCancel}>
             Cancel
-          </Button>,
-        ]}
-        ouiaId="CreateBucketModal"
-      >
-        <Form
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (newBucketName.length > 2 && validateBucketName(newBucketName)) {
-              handleNewBucketCreate();
-            }
-          }}
-        >
-          <FormGroup label="Bucket name" isRequired fieldId="bucket-name">
-            <TextInput
-              isRequired
-              type="text"
-              id="bucket-name"
-              name="bucket-name"
-              aria-describedby="bucket-name-helper"
-              placeholder="Enter at least 3 characters"
-              value={newBucketName}
-              onChange={(_event, newBucketName) => setNewBucketName(newBucketName)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  event.preventDefault();
-                  if (newBucketName.length > 2 && validateBucketName(newBucketName)) {
-                    handleNewBucketCreate();
-                  }
-                }
-              }}
-            />
-          </FormGroup>
-        </Form>
-        <Content hidden={!newBucketNameRulesVisibility}>
-          <Content component={ContentVariants.small} className="bucket-name-rules">
-            Bucket names must:
-            <ul>
-              <li>be unique,</li>
-              <li>be between 3 and 63 characters,</li>
-              <li>start with a lowercase letter or number,</li>
-              <li>only contain lowercase letters, numbers and hyphens,</li>
-              <li>not end with an hyphen,</li>
-              <li>not contain consecutive periods or dashes adjacent to periods,</li>
-              <li>not be formatted as an IP address.</li>
-            </ul>
-          </Content>
-        </Content>
+          </Button>
+        </ModalFooter>
       </Modal>
       <Modal
-        title={'Delete bucket?'}
-        titleIconVariant="warning"
-        className="bucket-modal"
+        className="standard-modal"
         isOpen={isDeleteBucketModalOpen}
         onClose={handleDeleteBucketModalToggle}
-        actions={[
+      >
+        <ModalHeader title="Delete bucket?" titleIconVariant="warning" />
+        <ModalBody>
+          <Content>
+            <Content component={ContentVariants.p}>This action cannot be undone.</Content>
+            <Content component={ContentVariants.p}>
+              Type <strong>{selectedBucket}</strong> to confirm deletion.
+            </Content>
+          </Content>
+          <TextInput
+            id="delete-modal-input"
+            aria-label="Delete modal input"
+            value={bucketToDelete}
+            onChange={(_event, bucketToDelete) => setBucketToDelete(bucketToDelete)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                if (validateBucketToDelete()) {
+                  handleDeleteBucketConfirm();
+                }
+              }
+            }}
+          />
+        </ModalBody>
+        <ModalFooter>
           <Button
             key="confirm"
             variant="danger"
@@ -610,32 +635,11 @@ const Buckets: React.FunctionComponent = () => {
             isDisabled={!validateBucketToDelete()}
           >
             Delete bucket
-          </Button>,
+          </Button>
           <Button key="cancel" variant="secondary" onClick={handleDeleteBucketCancel}>
             Cancel
-          </Button>,
-        ]}
-      >
-        <Content>
-          <Content component={ContentVariants.p}>This action cannot be undone.</Content>
-          <Content component={ContentVariants.p}>
-            Type <strong>{selectedBucket}</strong> to confirm deletion.
-          </Content>
-        </Content>
-        <TextInput
-          id="delete-modal-input"
-          aria-label="Delete modal input"
-          value={bucketToDelete}
-          onChange={(_event, bucketToDelete) => setBucketToDelete(bucketToDelete)}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') {
-              event.preventDefault();
-              if (validateBucketToDelete()) {
-                handleDeleteBucketConfirm();
-              }
-            }
-          }}
-        />
+          </Button>
+        </ModalFooter>
       </Modal>
     </div>
   );

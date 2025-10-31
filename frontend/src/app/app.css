@@ -81,7 +81,7 @@ body,
   padding-block-end: 6px !important;
 }
 
-.bucket-modal {
+.standard-modal {
   width: 50%;
 }
 
@@ -103,11 +103,15 @@ body,
 .folder-icon {
   padding-left: 0px;
   padding-right: 10px;
+  font-size: 1.75rem;
+  vertical-align: middle;
 }
 
 .file-icon {
   padding-left: 0px;
   padding-right: 10px;
+  font-size: 1.5rem;
+  vertical-align: middle;
 }
 
 .button-folder-link {
@@ -116,6 +120,10 @@ body,
 
 .button-file-control {
   margin-right: 5px;
+}
+
+.button-file-control svg {
+  font-size: 1rem;
 }
 
 .file-viewer-modal {
@@ -180,4 +188,9 @@ body,
   width: 60%;
   height: 1px;
   background-color: #ccc; /* light gray color */
+}
+
+.file-viewer-wrapper {
+  height: 70vh; /* or any fixed/relative size you want */
+  overflow: auto;
 }

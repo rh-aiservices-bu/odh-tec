@@ -177,6 +177,52 @@ export const updateS3Config = (
 | `NODE_ENV`  | No       | `development` | Environment mode | `development`, `production`      |
 | `PORT`      | No       | `8888`        | Server port      | `8888`, `3000`                   |
 | `LOG_LEVEL` | No       | `info`        | Logging level    | `debug`, `info`, `warn`, `error` |
+| `NB_PREFIX` | No       | -             | URL path prefix  | `/notebook/namespace`, `/my-app` |
+
+**NB_PREFIX** - URL Path Prefix:
+
+**Purpose**: Serve the application under a subpath (e.g., `https://my-cluster.org/notebook/namespace/` instead of `https://my-cluster.org/`)
+
+**Use Cases**:
+
+- **Gateway API HTTPRoute** with path-based routing
+- **OpenShift AI/RHOAI** workbench deployment (`/notebook/{namespace}/{workbench-name}`)
+- **Ingress** with path prefix
+- **Reverse proxy** with subpath routing
+
+**Behavior**:
+
+- Automatically normalized (leading slash added, trailing slash removed)
+- Applies to both frontend routing and backend API endpoints
+- Works in both development and production modes
+- Leave empty or unset for root deployment (default)
+
+**Examples**:
+
+```bash
+# OpenShift AI workbench
+NB_PREFIX=/notebook/my-namespace/my-workbench
+
+# Gateway API routing
+NB_PREFIX=/my-app
+
+# Custom prefix
+NB_PREFIX=/odh-tec
+
+# Root deployment (default)
+# NB_PREFIX=
+```
+
+**Normalization Examples**:
+
+```bash
+# Input variations → Normalized output
+NB_PREFIX=/my-app        → /my-app
+NB_PREFIX=my-app         → /my-app
+NB_PREFIX=/my-app/       → /my-app
+NB_PREFIX=my-app/        → /my-app
+NB_PREFIX=/              → (empty, root deployment)
+```
 
 #### File Type Validation
 
@@ -308,6 +354,13 @@ PORT=8888
 
 # Logging level (debug | info | warn | error)
 LOG_LEVEL=info
+
+# URL path prefix for serving app under subpath (default: root)
+# Used for Gateway API HTTPRoute, Ingress, or OpenShift AI workbench
+# Examples:
+#   NB_PREFIX=/notebook/namespace/workbench  # OpenShift AI
+#   NB_PREFIX=/my-app                         # Gateway API
+# NB_PREFIX=
 
 # ===========================================
 # File Type Validation (Optional)

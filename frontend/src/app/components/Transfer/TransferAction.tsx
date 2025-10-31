@@ -1,14 +1,26 @@
 import * as React from 'react';
 import {
+  FileEntry,
   StorageType,
-  TransferConflict,
+  TransferItem,
   TransferRequest,
   storageService,
 } from '@app/services/storageService';
 import { DestinationPicker } from './DestinationPicker';
 import { ConflictResolutionModal } from './ConflictResolutionModal';
 import { TransferProgress } from './TransferProgress';
+import {
+  Alert,
+  Button,
+  DescriptionList,
+  DescriptionListDescription,
+  DescriptionListGroup,
+  DescriptionListTerm,
+  Modal,
+} from '@patternfly/react-core';
 import Emitter from '@app/utils/emitter';
+import config from '@app/config';
+import { formatBytes } from '@app/utils/format';
 
 interface TransferActionProps {
   sourceLocationId: string;
@@ -17,6 +29,7 @@ interface TransferActionProps {
   selectedFiles: string[];
   isOpen: boolean;
   onClose: () => void;
+  currentListing?: FileEntry[]; // New optional prop
 }
 
 /**
@@ -36,14 +49,60 @@ export const TransferAction: React.FC<TransferActionProps> = ({
   selectedFiles,
   isOpen,
   onClose,
+  currentListing = [], // Default to empty array if not provided
 }) => {
+  const buildTransferItems = (): TransferItem[] => {
+    return selectedFiles.map(itemPath => {
+      // Strip sourcePath prefix to make paths relative to the source directory
+      let relativePath = itemPath;
+      if (sourcePath) {
+        // Handle both "sourcePath/" and "sourcePath" prefixes
+        const sourcePathWithSlash = sourcePath.endsWith('/') ? sourcePath : `${sourcePath}/`;
+        if (itemPath.startsWith(sourcePathWithSlash)) {
+          relativePath = itemPath.substring(sourcePathWithSlash.length);
+        } else if (itemPath === sourcePath) {
+          // Edge case: transferring the directory itself
+          relativePath = '';
+        }
+      }
+
+      // Find item in current listing to determine type
+      const item = currentListing.find(entry => entry.path === itemPath);
+
+      // Handle symlink as file
+      const type = item?.type === 'symlink' ? 'file' : (item?.type as 'file' | 'directory') || 'file';
+
+      return {
+        path: relativePath,
+        type,
+      };
+    });
+  };
   const [step, setStep] = React.useState<'destination' | 'conflicts' | 'progress'>('destination');
   const [destinationLocationId, setDestinationLocationId] = React.useState<string>('');
   const [destinationPath, setDestinationPath] = React.useState<string>('');
   const [destinationType, setDestinationType] = React.useState<StorageType>('s3');
-  const [conflicts, setConflicts] = React.useState<TransferConflict[]>([]);
   const [jobId, setJobId] = React.useState<string | null>(null);
   const [sseUrl, setSseUrl] = React.useState<string | null>(null);
+
+  // Large folder warning state
+  const [showLargeFolderWarning, setShowLargeFolderWarning] = React.useState(false);
+  const [largeFolderWarningData, setLargeFolderWarningData] = React.useState<{
+    fileCount: number;
+    totalSize: number;
+    message: string;
+  } | null>(null);
+
+  // Pending transfer state (used for large folder warning)
+  const [pendingTransfer, setPendingTransfer] = React.useState<{
+    destLocationId: string;
+    destPath: string;
+    destType: StorageType;
+  } | null>(null);
+
+  // Conflict tracking state
+  const [conflictingFiles, setConflictingFiles] = React.useState<string[]>([]);
+  const [nonConflictingFiles, setNonConflictingFiles] = React.useState<string[]>([]);
 
   // Reset state when modal opens
   React.useEffect(() => {
@@ -51,44 +110,49 @@ export const TransferAction: React.FC<TransferActionProps> = ({
       setStep('destination');
       setDestinationLocationId('');
       setDestinationPath('');
-      setConflicts([]);
       setJobId(null);
       setSseUrl(null);
     }
   }, [isOpen]);
 
   const handleDestinationSelected = async (locationId: string, path: string) => {
-    setDestinationLocationId(locationId);
-    setDestinationPath(path);
-
     // Determine destination type from location ID
     const locations = await storageService.getLocations();
     const location = locations.find((loc) => loc.id === locationId);
-    if (location) {
-      setDestinationType(location.type);
-    }
+    const destType = location?.type || 's3';
 
     // Check for conflicts
     try {
-      const conflictPaths = await storageService.checkConflicts(
-        {
-          type: location?.type || 's3',
-          locationId,
-          path,
-        },
-        selectedFiles,
+      const items = buildTransferItems();
+      const conflictResponse = await storageService.checkConflicts(
+        sourceLocationId,
+        sourcePath,
+        items,
+        locationId,
+        path
       );
 
-      if (conflictPaths.length > 0) {
-        // Map conflict paths to TransferConflict objects
-        const conflictObjects: TransferConflict[] = conflictPaths.map((p) => ({
-          path: p,
-        }));
-        setConflicts(conflictObjects);
+      // Store large folder warning data
+      if (conflictResponse.warning) {
+        setShowLargeFolderWarning(true);
+        setLargeFolderWarningData(conflictResponse.warning);
+        setPendingTransfer({ destLocationId: locationId, destPath: path, destType });
+        return;
+      }
+
+      // Store conflict and non-conflicting file data
+      setConflictingFiles(conflictResponse.conflicts);
+      setNonConflictingFiles(conflictResponse.nonConflicting);
+
+      if (conflictResponse.conflicts.length > 0) {
+        // Set state for the conflict resolution modal
+        setDestinationLocationId(locationId);
+        setDestinationPath(path);
+        setDestinationType(destType);
         setStep('conflicts');
       } else {
-        // No conflicts, proceed with transfer
-        await initiateTransfer('rename');
+        // No conflicts, proceed with transfer using values directly
+        await initiateTransfer('rename', locationId, path, destType);
       }
     } catch (error) {
       console.error('Failed to check conflicts:', error);
@@ -100,16 +164,51 @@ export const TransferAction: React.FC<TransferActionProps> = ({
     }
   };
 
+const handleProceedWithTransfer = async () => {
+  setShowLargeFolderWarning(false);
+
+  // Check for conflicts (warning already shown, now check conflicts)
+  if (pendingTransfer) {
+    const items = buildTransferItems();
+    const response = await storageService.checkConflicts(
+      sourceLocationId,
+      sourcePath,
+      items,
+      pendingTransfer.destLocationId,
+      pendingTransfer.destPath,
+    );
+
+    if (response.conflicts.length > 0) {
+      setConflictingFiles(response.conflicts);
+      setNonConflictingFiles(response.nonConflicting);
+      setDestinationLocationId(pendingTransfer.destLocationId);
+      setDestinationPath(pendingTransfer.destPath);
+      setDestinationType(pendingTransfer.destType);
+      setStep('conflicts');
+    } else {
+      // No conflicts - proceed
+      await initiateTransfer(
+        'skip',
+        pendingTransfer.destLocationId,
+        pendingTransfer.destPath,
+        pendingTransfer.destType
+      );
+    }
+  }
+};
+
   const handleConflictsResolved = async (
-    resolutions: Record<string, 'overwrite' | 'skip' | 'rename'>,
+    resolution: 'overwrite' | 'skip' | 'rename',
   ) => {
-    // For simplicity, use the first resolution as the default
-    // In a more advanced implementation, we could handle per-file resolutions
-    const firstResolution = Object.values(resolutions)[0] || 'rename';
-    await initiateTransfer(firstResolution);
+    await initiateTransfer(resolution, destinationLocationId, destinationPath, destinationType);
   };
 
-  const initiateTransfer = async (conflictResolution: 'overwrite' | 'skip' | 'rename') => {
+  const initiateTransfer = async (
+    conflictResolution: 'overwrite' | 'skip' | 'rename',
+    destLocationId: string,
+    destPath: string,
+    destType: StorageType,
+  ) => {
     const transferRequest: TransferRequest = {
       source: {
         type: sourceType,
@@ -117,18 +216,18 @@ export const TransferAction: React.FC<TransferActionProps> = ({
         path: sourcePath,
       },
       destination: {
-        type: destinationType,
-        locationId: destinationLocationId,
-        path: destinationPath,
+        type: destType,
+        locationId: destLocationId,
+        path: destPath,
       },
-      files: selectedFiles,
+      items: buildTransferItems(),
       conflictResolution,
     };
 
     try {
       const response = await storageService.initiateTransfer(transferRequest);
       setJobId(response.jobId);
-      setSseUrl(response.sseUrl);
+      setSseUrl(`${config.backend_api_url}${response.sseUrl}`);
       setStep('progress');
 
       Emitter.emit('notification', {
@@ -151,7 +250,6 @@ export const TransferAction: React.FC<TransferActionProps> = ({
     setStep('destination');
     setDestinationLocationId('');
     setDestinationPath('');
-    setConflicts([]);
     setJobId(null);
     setSseUrl(null);
     onClose();
@@ -170,7 +268,8 @@ export const TransferAction: React.FC<TransferActionProps> = ({
       {step === 'conflicts' && (
         <ConflictResolutionModal
           isOpen={true}
-          conflicts={conflicts}
+          conflictingFiles={conflictingFiles}
+          nonConflictingFiles={nonConflictingFiles}
           onResolve={handleConflictsResolved}
           onCancel={handleCancel}
         />
@@ -178,6 +277,65 @@ export const TransferAction: React.FC<TransferActionProps> = ({
 
       {step === 'progress' && (
         <TransferProgress isOpen={true} jobId={jobId} sseUrl={sseUrl} onClose={handleCancel} />
+      )}
+
+      {showLargeFolderWarning && largeFolderWarningData && (
+        <Modal
+          variant="small"
+          title="Large Folder Transfer"
+          isOpen={showLargeFolderWarning}
+          onClose={() => {
+            setShowLargeFolderWarning(false);
+            setLargeFolderWarningData(null);
+          }}
+        >
+          <div>
+            <Alert
+              variant="warning"
+              isInline
+              title="Large transfer operation"
+            >
+              <p>{largeFolderWarningData.message}</p>
+            </Alert>
+            <br />
+            <DescriptionList isHorizontal>
+              <DescriptionListGroup>
+                <DescriptionListTerm>Files to transfer</DescriptionListTerm>
+                <DescriptionListDescription>
+                  {largeFolderWarningData.fileCount.toLocaleString()} files
+                </DescriptionListDescription>
+              </DescriptionListGroup>
+              <DescriptionListGroup>
+                <DescriptionListTerm>Total size</DescriptionListTerm>
+                <DescriptionListDescription>
+                  {formatBytes(largeFolderWarningData.totalSize)}
+                </DescriptionListDescription>
+              </DescriptionListGroup>
+            </DescriptionList>
+            <br />
+            <small>
+              This operation may take significant time to complete. You can monitor
+              progress in the transfer queue.
+            </small>
+          </div>
+          <div className="pf-c-modal-box__footer">
+            <Button
+              variant="link"
+              onClick={() => {
+                setShowLargeFolderWarning(false);
+                setLargeFolderWarningData(null);
+              }}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              onClick={handleProceedWithTransfer}
+            >
+              Proceed
+            </Button>
+          </div>
+        </Modal>
       )}
     </>
   );
