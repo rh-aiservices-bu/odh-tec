@@ -1,13 +1,21 @@
 <!DOCTYPE html>
+<% if (typeof nbPrefix !== 'undefined' && nbPrefix) { %>
+<html lang="en-US" data-nb-prefix="<%= nbPrefix %>">
+<% } else { %>
 <html lang="en-US">
+<% } %>
 
 <head>
   <meta charset="utf-8">
   <title>Open Data Hub Tools &amp; Extensions Companion</title>
   <meta id="appName" name="application-name" content="Open Data Hub Tools & Extensions Companion">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="icon" type="image/svg+xml" href="/images/favicon.svg">
+  <link rel="icon" type="image/svg+xml" href="images/favicon.svg">
+  <% if (typeof nbPrefix !== 'undefined' && nbPrefix) { %>
+  <base href="<%= nbPrefix %>/">
+  <% } else { %>
   <base href="/">
+  <% } %>
 </head>
 
 <body>

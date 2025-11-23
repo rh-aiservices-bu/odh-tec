@@ -9,6 +9,7 @@ import {
 
 import { getS3Config } from '../../../utils/config';
 import { logAccess } from '../../../utils/logAccess';
+import { sanitizeErrorForLogging } from '../../../utils/errorLogging';
 
 export default async (fastify: FastifyInstance): Promise<void> => {
   // Retrieve all accessible buckets
@@ -49,7 +50,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
           message: error.message || 'An S3 service exception occurred.',
         });
       } else {
-        console.error('Error listing buckets', error);
+        console.error('Error listing buckets:', sanitizeErrorForLogging(error));
         reply.code(500).send({
           error: error.name || 'Unknown error',
           message: error.message || 'An unexpected error occurred.',
@@ -79,7 +80,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
           message: error.message || 'An S3 service exception occurred.',
         });
       } else {
-        console.error('Error creating bucket', error);
+        console.error('Error creating bucket:', sanitizeErrorForLogging(error));
         reply.code(500).send({
           error: error.name || 'Unknown error',
           message: error.message || 'An unexpected error occurred.',
@@ -110,7 +111,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
           message: error.message || 'An S3 service exception occurred.',
         });
       } else {
-        console.error('Error deleting bucket', error);
+        console.error('Error deleting bucket:', sanitizeErrorForLogging(error));
         reply.code(500).send({
           error: error.name || 'Unknown error',
           message: error.message || 'An unexpected error occurred.',

@@ -1,5 +1,6 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { getLastAccessLogEntry } from '../utils/logAccess';
+import { NB_PREFIX } from '../utils/constants';
 
 // Route configuration
 const ROUTES = {
@@ -27,7 +28,8 @@ const handlers = {
   },
 
   redirectToRoot: async (_req: FastifyRequest, reply: FastifyReply) => {
-    reply.redirect('/');
+    const rootPath = NB_PREFIX || '/';
+    reply.redirect(rootPath);
   },
 };
 
@@ -45,31 +47,14 @@ const registerRoute = (
   }
 };
 
-// Helper function to register all API routes for a given prefix
-const registerApiRoutes = (fastify: FastifyInstance, prefix = '') => {
-  const prefixedPath = (path: string) => `${prefix}${path}`;
+export default async (fastify: FastifyInstance): Promise<void> => {
   const accessLogHandler = handlers.getAccessLog(fastify.log);
 
-  // Health check endpoints
-  registerRoute(fastify, 'get', prefixedPath(ROUTES.API), handlers.healthCheck);
+  // Health check endpoints (prefix applied at app level if NB_PREFIX is set)
+  registerRoute(fastify, 'get', ROUTES.API, handlers.healthCheck);
 
-  // Access log endpoints
-  registerRoute(fastify, 'get', prefixedPath(ROUTES.KERNELS), accessLogHandler);
-  registerRoute(fastify, 'get', prefixedPath(ROUTES.TERMINALS), accessLogHandler);
-};
-
-export default async (fastify: FastifyInstance): Promise<void> => {
-  const nbPrefix = process.env.NB_PREFIX;
-
-  if (nbPrefix) {
-    // Register OpenShift AI environment routes with prefix
-    registerApiRoutes(fastify, nbPrefix);
-
-    // Redirect handlers for prefixed routes
-    registerRoute(fastify, 'get', `${nbPrefix}/*`, handlers.redirectToRoot, false);
-    registerRoute(fastify, 'get', nbPrefix, handlers.redirectToRoot, false);
-  }
-
-  // Register standard routes (always available)
-  registerApiRoutes(fastify);
+  // OpenShift AI/RHOAI compatibility endpoints for notebook health checks
+  // These are used by the platform to verify the workbench is running
+  registerRoute(fastify, 'get', ROUTES.KERNELS, accessLogHandler);
+  registerRoute(fastify, 'get', ROUTES.TERMINALS, accessLogHandler);
 };

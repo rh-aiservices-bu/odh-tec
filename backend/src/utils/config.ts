@@ -3,6 +3,9 @@ import { NodeJsClient } from '@smithy/types';
 import { NodeHttpHandler } from '@aws-sdk/node-http-handler';
 import { HttpProxyAgent } from 'http-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
+import { getApplyMd5BodyChecksumPlugin } from '@aws-sdk/middleware-apply-body-checksum';
+import http from 'http';
+import https from 'https';
 
 // Initial configuration
 let accessKeyId = process.env.AWS_ACCESS_KEY_ID || '';
@@ -12,8 +15,27 @@ let endpoint = process.env.AWS_S3_ENDPOINT || '';
 let defaultBucket = process.env.AWS_S3_BUCKET || '';
 let hfToken = process.env.HF_TOKEN || '';
 let maxConcurrentTransfers = parseInt(process.env.MAX_CONCURRENT_TRANSFERS || '2', 10);
+let maxFilesPerPage = parseInt(process.env.MAX_FILES_PER_PAGE || '100', 10);
 let httpProxy = process.env.HTTP_PROXY || '';
 let httpsProxy = process.env.HTTPS_PROXY || '';
+
+// Parse LOCAL_STORAGE_PATHS from environment
+// Default: single directory at /opt/app-root/src/data
+let localStoragePaths: string[] = process.env.LOCAL_STORAGE_PATHS
+  ? process.env.LOCAL_STORAGE_PATHS.split(',')
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0)
+  : ['/opt/app-root/src/data'];
+
+// Parse MAX_FILE_SIZE_GB from environment
+// Default: 20GB
+let maxFileSizeGB: number = parseInt(process.env.MAX_FILE_SIZE_GB || '20', 10);
+
+// Validate maxFileSizeGB
+if (isNaN(maxFileSizeGB) || maxFileSizeGB <= 0) {
+  console.warn(`Invalid MAX_FILE_SIZE_GB: ${process.env.MAX_FILE_SIZE_GB}, using default: 20`);
+  maxFileSizeGB = 20;
+}
 
 export const initializeS3Client = (): S3Client => {
   const s3ClientOptions: any = {
@@ -24,36 +46,63 @@ export const initializeS3Client = (): S3Client => {
       accessKeyId: accessKeyId,
       secretAccessKey: secretAccessKey,
     },
+    // AWS SDK retry configuration
+    maxAttempts: 5, // Retry up to 5 times
+    retryMode: 'adaptive', // Adaptive retry mode with exponential backoff
+  };
+
+  // HTTP agent configuration for connection pooling and keep-alive
+  const agentOptions: http.AgentOptions = {
+    keepAlive: true, // Reuse TCP connections
+    keepAliveMsecs: 1000, // Send keep-alive probes every 1 second
+    maxSockets: 10, // Allow up to 10 concurrent connections
+    maxFreeSockets: 5, // Keep up to 5 idle connections
+    timeout: 30000, // 30 second socket timeout
   };
 
   const agentConfig: {
-    httpAgent?: HttpProxyAgent<string>;
-    httpsAgent?: HttpsProxyAgent<string>;
+    httpAgent?: HttpProxyAgent<string> | http.Agent;
+    httpsAgent?: HttpsProxyAgent<string> | https.Agent;
   } = {};
 
+  // Configure HTTP agent (proxy or regular)
   if (httpProxy) {
     try {
       agentConfig.httpAgent = new HttpProxyAgent<string>(httpProxy);
     } catch (e) {
       console.error('Failed to create HttpProxyAgent:', e);
     }
+  } else {
+    agentConfig.httpAgent = new http.Agent(agentOptions);
   }
 
+  // Configure HTTPS agent (proxy or regular)
   if (httpsProxy) {
     try {
       agentConfig.httpsAgent = new HttpsProxyAgent<string>(httpsProxy);
     } catch (e) {
       console.error('Failed to create HttpsProxyAgent:', e);
     }
+  } else {
+    agentConfig.httpsAgent = new https.Agent(agentOptions);
   }
 
-  if (agentConfig.httpAgent || agentConfig.httpsAgent) {
-    s3ClientOptions.requestHandler = new NodeHttpHandler({
-      ...(agentConfig.httpAgent && { httpAgent: agentConfig.httpAgent }),
-      ...(agentConfig.httpsAgent && { httpsAgent: agentConfig.httpsAgent }),
-    });
-  }
-  return new S3Client(s3ClientOptions) as NodeJsClient<S3Client>;
+  // Always configure request handler with connection pooling and timeouts
+  s3ClientOptions.requestHandler = new NodeHttpHandler({
+    connectionTimeout: 5000, // 5 second connection timeout
+    requestTimeout: 300000, // 5 minute request timeout (for large files)
+    httpAgent: agentConfig.httpAgent,
+    httpsAgent: agentConfig.httpsAgent,
+  });
+
+  const client = new S3Client(s3ClientOptions) as NodeJsClient<S3Client>;
+
+  // Apply MD5 checksum middleware for Minio compatibility
+  // Minio requires Content-MD5 header for DELETE operations (both single and bulk)
+  // This middleware automatically adds Content-MD5 to operations that support it
+  client.middlewareStack.use(getApplyMd5BodyChecksumPlugin(client.config));
+
+  return client;
 };
 
 let s3Client = initializeS3Client();
@@ -114,4 +163,83 @@ export const getMaxConcurrentTransfers = (): number => {
 
 export const updateMaxConcurrentTransfers = (newMaxConcurrentTransfers: number): void => {
   maxConcurrentTransfers = newMaxConcurrentTransfers;
+};
+
+export const getMaxFilesPerPage = (): number => {
+  return maxFilesPerPage;
+};
+
+export const updateMaxFilesPerPage = (newMaxFilesPerPage: number): void => {
+  maxFilesPerPage = newMaxFilesPerPage;
+};
+
+/**
+ * Get configured local storage paths
+ * @returns Array of filesystem paths that can be used for local storage
+ */
+export const getLocalStoragePaths = (): string[] => {
+  return [...localStoragePaths]; // Return copy to prevent mutation
+};
+
+/**
+ * Get maximum file size limit in GB
+ * @returns Maximum file size in gigabytes
+ */
+export const getMaxFileSizeGB = (): number => {
+  return maxFileSizeGB;
+};
+
+/**
+ * Get maximum file size limit in bytes
+ * @returns Maximum file size in bytes
+ */
+export const getMaxFileSizeBytes = (): number => {
+  return maxFileSizeGB * 1024 * 1024 * 1024;
+};
+
+/**
+ * Update local storage paths at runtime (for testing or runtime configuration)
+ * @param newPaths - Array of filesystem paths
+ */
+export const updateLocalStoragePaths = (newPaths: string[]): void => {
+  localStoragePaths = newPaths.filter((p) => p.trim().length > 0);
+};
+
+/**
+ * Update maximum file size limit at runtime
+ * @param newLimitGB - New limit in gigabytes
+ */
+export const updateMaxFileSizeGB = (newLimitGB: number): void => {
+  if (newLimitGB > 0 && !isNaN(newLimitGB)) {
+    maxFileSizeGB = newLimitGB;
+  } else {
+    throw new Error(`Invalid file size limit: ${newLimitGB}`);
+  }
+};
+
+/**
+ * Validate a file size against the configured limit
+ * @param sizeBytes - File size in bytes
+ * @returns true if file size is within limit
+ */
+export const isFileSizeValid = (sizeBytes: number): boolean => {
+  return sizeBytes <= getMaxFileSizeBytes();
+};
+
+/**
+ * Format file size for error messages
+ * @param sizeBytes - File size in bytes
+ * @returns Formatted string (e.g., "25.5 GB")
+ */
+export const formatFileSize = (sizeBytes: number): string => {
+  const gb = sizeBytes / (1024 * 1024 * 1024);
+  if (gb >= 1) {
+    return `${gb.toFixed(2)} GB`;
+  }
+  const mb = sizeBytes / (1024 * 1024);
+  if (mb >= 1) {
+    return `${mb.toFixed(2)} MB`;
+  }
+  const kb = sizeBytes / 1024;
+  return `${kb.toFixed(2)} KB`;
 };

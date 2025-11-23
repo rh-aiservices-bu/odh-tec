@@ -1,14 +1,14 @@
 {
   "name": "odh-tec-frontend",
-  "version": "2.0.7",
+  "version": "2.1.0",
   "description": "Frontend for the Open Data Hub Tools & Extensions Companion.",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/opendatahub-io-contrib/odh-tec.git"
+    "url": "git+https://github.com/rh-aiservices.bu/odh-tec.git"
   },
   "homepage": "",
   "bugs": {
-    "url": "https://github.com/opendatahub-io-contrib/odh-tec/issues"
+    "url": "https://github.com/rh-aiservices.bu/odh-tec/issues"
   },
   "license": "Apache-2.0",
   "private": true,
@@ -36,10 +36,14 @@
     "@testing-library/react": "^16.3.0",
     "@testing-library/user-event": "14.6.1",
     "@types/jest": "^29.5.14",
+    "@types/react": "^18.2.15",
+    "@types/react-dom": "^18.2.7",
     "@types/react-router-dom": "^5.3.3",
+    "@types/uuid": "^10.0.0",
     "@types/victory": "^35.0.0",
     "@typescript-eslint/eslint-plugin": "^8.29.0",
     "@typescript-eslint/parser": "^8.29.0",
+    "axios-mock-adapter": "^1.22.0",
     "babel-plugin-transform-imports": "^2.0.0",
     "copy-webpack-plugin": "^13.0.0",
     "css-loader": "^7.1.2",
@@ -56,6 +60,7 @@
     "jest": "^29.7.0",
     "jest-environment-jsdom": "^29.7.0",
     "mini-css-extract-plugin": "^2.9.2",
+    "monaco-editor-webpack-plugin": "^7.1.1",
     "postcss": "^8.5.3",
     "prettier": "^3.5.3",
     "prop-types": "^15.8.1",
@@ -65,12 +70,8 @@
     "react-docgen-typescript-loader": "^3.7.2",
     "react-dom": "^18.3.1",
     "react-i18next": "^14.1.3",
-    "react-markdown": "^9.1.0",
     "react-router-dom": "^7.1.5",
-    "react-syntax-highlighter": "^15.6.1",
     "regenerator-runtime": "^0.14.1",
-    "rehype-raw": "^7.0.0",
-    "remark-gfm": "^4.0.1",
     "rimraf": "^6.0.1",
     "sirv-cli": "^3.0.1",
     "style-loader": "^4.0.0",
@@ -91,11 +92,6 @@
   "dependencies": {
     "@emotion/react": "^11.11.1",
     "@emotion/styled": "^11.11.0",
-    "@fontsource/roboto": "^5.0.8",
-    "@fortawesome/fontawesome-svg-core": "^6.7.2",
-    "@fortawesome/free-regular-svg-icons": "^6.7.2",
-    "@fortawesome/free-solid-svg-icons": "^6.7.2",
-    "@fortawesome/react-fontawesome": "^0.2.2",
     "@mui/icons-material": "^5.15.0",
     "@mui/material": "^5.14.20",
     "@patternfly/patternfly": "^6.2.3",
@@ -115,6 +111,7 @@
     "react-router": "^7.1.5",
     "react-router-dom": "^7.1.5",
     "recharts": "2.13.0-alpha.1",
-    "sirv-cli": "^3.0.1"
+    "sirv-cli": "^3.0.1",
+    "uuid": "^13.0.0"
   }
 }

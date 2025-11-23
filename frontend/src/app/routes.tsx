@@ -1,18 +1,28 @@
 import { NotFound } from '@app/components/NotFound/NotFound';
 import * as React from 'react';
-import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
+import { Route, Routes, useNavigate } from 'react-router-dom';
 import Buckets from './components/Buckets/Buckets';
-import ObjectBrowser from './components/ObjectBrowser/ObjectBrowser';
+import StorageBrowser from './components/StorageBrowser/StorageBrowser';
 import SettingsManagement from './components/Settings/Settings';
 import VramEstimator from './components/VramEstimator/VramEstimator';
 
-
-let routeFocusTimer: number;
+/**
+ * Custom redirect component.
+ * React Router v7's navigate() automatically respects the basename configured in the Router.
+ */
+const RedirectWithPrefix: React.FC<{ to: string }> = ({ to }) => {
+  const navigate = useNavigate();
+  React.useEffect(() => {
+    navigate(to);
+  }, [navigate, to]);
+  return null;
+};
 
 export interface IAppRoute {
   label?: string; // Excluding the label will exclude the route from the nav sidebar in AppLayout
   element: JSX.Element;
   path: string;
+  navPath?: string; // Optional navigation path for routes with parameters (uses path if not specified)
   title: string;
   routes?: undefined;
   bottomRoutes?: undefined;
@@ -27,23 +37,23 @@ export interface IAppRouteGroup {
 
 export type AppRouteConfig = IAppRoute | IAppRouteGroup;
 
-
 const routes: AppRouteConfig[] = [
   {
-    label: 'S3 Tools',
+    label: 'Storage Tools',
     isExpanded: true,
     routes: [
       {
-        element: <ObjectBrowser />,
-        label: 'Object Browser',
-        path: '/objects/:bucketName/:prefix?',
-        title: 'Object Browser',
+        element: <StorageBrowser />,
+        label: 'Storage Browser',
+        path: '/browse/:locationId?/:path?',
+        navPath: '/browse',
+        title: 'Storage Browser',
       },
       {
         element: <Buckets />,
-        label: 'Bucket Management',
+        label: 'Storage Management',
         path: '/buckets',
-        title: 'Bucket Management',
+        title: 'Storage Management',
       },
     ],
   },
@@ -60,7 +70,7 @@ const routes: AppRouteConfig[] = [
     ],
   },
   {
-    element: <Navigate to="/objects/:bucketName/:prefix?" />,
+    element: <RedirectWithPrefix to="/browse" />,
     path: '/',
     title: 'Redirect',
   },
@@ -71,35 +81,15 @@ const routes: AppRouteConfig[] = [
     title: 'Settings',
   },
   {
-    element: <Navigate to="/objects/:bucketName/:prefix?" />,
+    element: <RedirectWithPrefix to="/browse" />,
     path: '*',
     title: 'Redirect',
   },
 ];
 
-
-// a custom hook for sending focus to the primary content container
-// after a view has loaded so that subsequent press of tab key
-// sends focus directly to relevant content
-// may not be necessary if https://github.com/ReactTraining/react-router/issues/5210 is resolved
-const useA11yRouteChange = () => {
-  const { pathname } = useLocation();
-  React.useEffect(() => {
-    routeFocusTimer = window.setTimeout(() => {
-      const mainContainer = document.getElementById('primary-app-container');
-      if (mainContainer) {
-        mainContainer.focus();
-      }
-    }, 50);
-    return () => {
-      window.clearTimeout(routeFocusTimer);
-    };
-  }, [pathname]);
-};
-
 const flattenedRoutes: IAppRoute[] = routes.reduce(
   (flattened, route) => [...flattened, ...(route.routes ? route.routes : [route])],
-  [] as IAppRoute[]
+  [] as IAppRoute[],
 );
 
 const AppRoutes = (): React.ReactElement => (
@@ -107,7 +97,7 @@ const AppRoutes = (): React.ReactElement => (
     {flattenedRoutes.map((route, idx) => (
       <Route path={route.path} element={route.element} key={idx} />
     ))}
-    <Route element={<NotFound/>} />
+    <Route element={<NotFound />} />
   </Routes>
 );
 

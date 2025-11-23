@@ -3,24 +3,40 @@ import {
   DeleteObjectsCommand,
   GetObjectCommand,
   ListObjectsV2Command,
-  ListObjectsV2CommandOutput,
   S3Client,
   S3ServiceException,
 } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import axios, { AxiosRequestConfig } from 'axios';
 import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { request as httpsRequest } from 'https';
+import { request as httpRequest } from 'http';
 import { HttpProxyAgent } from 'http-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import { Readable } from 'stream';
-import {
-  getHFConfig,
-  getMaxConcurrentTransfers,
-  getProxyConfig,
-  getS3Config,
-} from '../../../utils/config';
+import { Readable, pipeline, PassThrough } from 'stream';
+import { URL } from 'url';
+import { promisify } from 'util';
+import { promises as fs, createWriteStream } from 'fs';
+import path from 'path';
+import { base64Decode } from '../../../utils/encoding';
+import { getHFConfig, getProxyConfig, getS3Config } from '../../../utils/config';
 import { logAccess } from '../../../utils/logAccess';
-import pLimit from 'p-limit';
+import { validatePath, SecurityError } from '../../../utils/localStorage';
+import { logMemory } from '../../../utils/memoryProfiler';
+import { transferQueue, TransferFileJob } from '../../../utils/transferQueue';
+import { uploadWithCleanup, createProgressTransform } from '../../../utils/streamHelpers';
+import { sanitizeErrorForLogging } from '../../../utils/errorLogging';
+import {
+  validateBucketName,
+  validateContinuationToken,
+  validateQuery,
+  validateAndDecodePrefix,
+} from '../../../utils/validation';
+import { authenticateUser } from '../../../plugins/auth';
+import { auditLog } from '../../../utils/auditLog';
+import { checkRateLimit, getRateLimitResetTime } from '../../../utils/rateLimit';
+
+const pipelineAsync = promisify(pipeline);
 
 interface UploadProgress {
   loaded: number;
@@ -38,15 +54,6 @@ type Sibling = {
 
 type Siblings = Sibling[];
 
-interface UploadError {
-  error: string;
-  message: string;
-}
-
-interface UploadErrors {
-  [key: string]: UploadError;
-}
-
 const createRef = (initialValue: any) => {
   return {
     current: initialValue,
@@ -56,19 +63,51 @@ const createRef = (initialValue: any) => {
 const abortUploadController = createRef(null);
 
 export default async (fastify: FastifyInstance): Promise<void> => {
+  /**
+   * Authentication hook - authenticates all requests to /api/objects/*
+   */
+  fastify.addHook('onRequest', async (request: FastifyRequest, reply: FastifyReply) => {
+    await authenticateUser(request, reply);
+  });
+
+  /**
+   * Audit logging hook - logs all requests after completion
+   */
+  fastify.addHook('onResponse', (request: FastifyRequest, reply: FastifyReply) => {
+    if (request.user) {
+      const params = request.params as any;
+      const bucketName = params.bucketName || 'unknown';
+      const encodedKey = params.encodedKey || '';
+      const resource = `s3:${bucketName}/${encodedKey ? base64Decode(encodedKey) : ''}`;
+      const status = reply.statusCode >= 200 && reply.statusCode < 300 ? 'success' : 'failure';
+      const action = request.method.toLowerCase();
+      auditLog(request.user, action, resource, status);
+    }
+  });
+
   // Server-side listing enhancements configuration
   const DEFAULT_MAX_KEYS = 500; // friendlier cadence for UI
   const MAX_ALLOWED_KEYS = 2000; // hard upper bound
-  const MAX_CONTAINS_SCAN_PAGES = 40; // safeguard to avoid runaway scans
-  const MAX_QUERY_LENGTH = 256; // validation upper bound for q
-  const QUERY_PATTERN = /^[\w.\- @()+=/:]*$/; // conservative allowlist (word chars, dot, dash, space & a few safe symbols)
+
+  // 🔐 SECURITY: DoS Prevention - Reduced from 40 to 5
+  const MAX_CONTAINS_SCAN_PAGES = 5; // CHANGED FROM 40
+
+  // 🔐 SECURITY: Rate limiting for expensive operations
+  const RATE_LIMIT_CONTAINS_SEARCH = 5; // requests per minute
+  const RATE_LIMIT_WINDOW_MS = 60000; // 1 minute
 
   interface FilterMeta {
     q?: string;
     mode?: 'startsWith' | 'contains';
     partialResult?: boolean; // true when search stopped before exhausting bucket
     scanPages?: number; // number of S3 pages scanned (contains or broadened)
-    scanStoppedReason?: 'maxKeysReached' | 'bucketExhausted' | 'scanCap';
+    objectsExamined?: number; // total objects examined across all pages
+    scanStoppedReason?:
+      | 'maxKeysReached'
+      | 'bucketExhausted'
+      | 'scanCap'
+      | 'examinedCap'
+      | 'timeout';
     autoBroaden?: boolean; // true when startsWith broadened to contains
     originalMode?: 'startsWith';
     matches?: {
@@ -83,25 +122,6 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     return Math.min(Math.max(1, n), MAX_ALLOWED_KEYS);
   };
 
-  type ListContext = {
-    bucket: string;
-    prefix?: string; // decoded prefix (may be empty string)
-    delimiter?: string;
-    continuationToken?: string;
-    maxKeys: number;
-  };
-
-  const listPage = async (s3Client: S3Client, ctx: ListContext, token?: string): Promise<ListObjectsV2CommandOutput> => {
-    const command = new ListObjectsV2Command({
-      Bucket: ctx.bucket,
-      Prefix: ctx.prefix || undefined,
-      Delimiter: ctx.delimiter || '/',
-      ContinuationToken: token || ctx.continuationToken || undefined,
-      MaxKeys: ctx.maxKeys,
-    });
-    return s3Client.send(command);
-  };
-
   interface EnhancedResult {
     objects: any[] | undefined;
     prefixes: any[] | undefined;
@@ -114,20 +134,26 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     reply.send(payload);
   };
 
-  const applyContainsFilter = (
+  const applyFilter = (
     Contents: any[] | undefined,
     CommonPrefixes: any[] | undefined,
-    qLower: string
+    qLower: string,
+    mode: 'startsWith' | 'contains' = 'contains',
   ) => {
-    const filteredObjects = Contents?.filter(o => {
+    const matchFn =
+      mode === 'startsWith'
+        ? (text: string) => text.toLowerCase().startsWith(qLower)
+        : (text: string) => text.toLowerCase().includes(qLower);
+
+    const filteredObjects = Contents?.filter((o) => {
       const key: string = o.Key || '';
       const last = key.split('/').pop() || key;
-      return last.toLowerCase().includes(qLower);
+      return matchFn(last);
     });
-    const filteredPrefixes = CommonPrefixes?.filter(p => {
+    const filteredPrefixes = CommonPrefixes?.filter((p) => {
       const pref: string = p.Prefix || '';
       const last = pref.endsWith('/') ? pref.slice(0, -1).split('/').pop() : pref.split('/').pop();
-      return (last || '').toLowerCase().includes(qLower);
+      return matchFn(last || '');
     });
     return { filteredObjects, filteredPrefixes };
   };
@@ -146,7 +172,11 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     return ranges;
   };
 
-  const addMatchMetadata = (objects: any[] | undefined, prefixes: any[] | undefined, qLower: string): FilterMeta['matches'] => {
+  const addMatchMetadata = (
+    objects: any[] | undefined,
+    prefixes: any[] | undefined,
+    qLower: string,
+  ): FilterMeta['matches'] => {
     const objMatches: Record<string, [number, number][]> = {};
     const prefMatches: Record<string, [number, number][]> = {};
     if (objects) {
@@ -174,25 +204,33 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     decoded_prefix: string | undefined,
     continuationToken: string | undefined,
     qLower: string,
-    effectiveMaxKeys: number
+    effectiveMaxKeys: number,
+    mode: 'startsWith' | 'contains' = 'contains',
   ) => {
     let nextToken: string | undefined = continuationToken || undefined;
     let aggregatedObjects: any[] = [];
-    let aggregatedPrefixes: any[] = [];
+    const aggregatedPrefixes: any[] = [];
     let underlyingTruncated = false;
     let lastUnderlyingToken: string | undefined = undefined;
     let pagesScanned = 0;
 
     while (pagesScanned < MAX_CONTAINS_SCAN_PAGES) {
-      const page = await s3Client.send(new ListObjectsV2Command({
-        Bucket: bucketName,
-        Delimiter: '/',
-        Prefix: decoded_prefix || undefined,
-        ContinuationToken: nextToken,
-        MaxKeys: DEFAULT_MAX_KEYS,
-      }));
+      const page = await s3Client.send(
+        new ListObjectsV2Command({
+          Bucket: bucketName,
+          Delimiter: '/',
+          Prefix: decoded_prefix || undefined,
+          ContinuationToken: nextToken,
+          MaxKeys: DEFAULT_MAX_KEYS,
+        }),
+      );
       pagesScanned += 1;
-      const { filteredObjects, filteredPrefixes } = applyContainsFilter(page.Contents, page.CommonPrefixes, qLower);
+      const { filteredObjects, filteredPrefixes } = applyFilter(
+        page.Contents,
+        page.CommonPrefixes,
+        qLower,
+        mode,
+      );
       if (filteredObjects) aggregatedObjects.push(...filteredObjects);
       if (filteredPrefixes) aggregatedPrefixes.push(...filteredPrefixes);
       underlyingTruncated = !!page.IsTruncated;
@@ -208,7 +246,11 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     }
 
     let scanStoppedReason: 'maxKeysReached' | 'bucketExhausted' | 'scanCap';
-    if (pagesScanned >= MAX_CONTAINS_SCAN_PAGES && underlyingTruncated && aggregatedObjects.length < effectiveMaxKeys) {
+    if (
+      pagesScanned >= MAX_CONTAINS_SCAN_PAGES &&
+      underlyingTruncated &&
+      aggregatedObjects.length < effectiveMaxKeys
+    ) {
       scanStoppedReason = 'scanCap';
     } else if (aggregatedObjects.length >= effectiveMaxKeys) {
       scanStoppedReason = 'maxKeysReached';
@@ -216,8 +258,10 @@ export default async (fastify: FastifyInstance): Promise<void> => {
       scanStoppedReason = 'bucketExhausted';
     }
 
-    const morePossible = (underlyingTruncated && (aggregatedObjects.length >= effectiveMaxKeys || scanStoppedReason === 'scanCap'));
-    const responseToken = morePossible ? (lastUnderlyingToken || null) : null;
+    const morePossible =
+      underlyingTruncated &&
+      (aggregatedObjects.length >= effectiveMaxKeys || scanStoppedReason === 'scanCap');
+    const responseToken = morePossible ? lastUnderlyingToken || null : null;
 
     return {
       aggregatedObjects,
@@ -232,41 +276,56 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     req: FastifyRequest,
     reply: FastifyReply,
     bucketName: string,
-    decoded_prefix: string | undefined
+    encodedPrefix: string | undefined,
   ) => {
     logAccess(req);
     const { s3Client } = getS3Config();
     const { continuationToken, q, mode, maxKeys, autoBroaden } = (req.query || {}) as any;
 
-    // Enhanced input validation
-    if (bucketName && !/^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$/.test(bucketName)) {
+    // Input validation using secure validation functions
+    const bucketError = validateBucketName(bucketName);
+    if (bucketError) {
       reply.code(400).send({
         error: 'InvalidBucketName',
-        message: 'Bucket name must be valid S3 bucket name format.',
+        message: bucketError,
       });
       return;
     }
 
-    if (continuationToken && (typeof continuationToken !== 'string' || continuationToken.length > 1024)) {
+    const tokenError = validateContinuationToken(continuationToken);
+    if (tokenError) {
       reply.code(400).send({
         error: 'InvalidContinuationToken',
-        message: 'Continuation token is invalid or too long.',
+        message: tokenError,
       });
       return;
     }
 
-    if (q) {
-      if (typeof q !== 'string' || q.length > MAX_QUERY_LENGTH || !QUERY_PATTERN.test(q)) {
-        reply.code(400).send({
-          error: 'InvalidQuery',
-            message: `Query parameter 'q' is invalid. Max length ${MAX_QUERY_LENGTH}, allowed pattern ${QUERY_PATTERN.toString()}.`,
-        });
-        return;
-      }
+    const queryError = validateQuery(q);
+    if (queryError) {
+      reply.code(400).send({
+        error: 'InvalidQuery',
+        message: queryError,
+      });
+      return;
+    }
+
+    // Validate and decode prefix
+    const { decoded: decoded_prefix, error: prefixError } = validateAndDecodePrefix(encodedPrefix);
+    if (prefixError) {
+      reply.code(400).send({
+        error: 'InvalidPrefix',
+        message: prefixError,
+      });
+      return;
     }
 
     const effectiveMaxKeys = normalizeMaxKeys(maxKeys);
-    const requestedMode: 'startsWith' | 'contains' | undefined = q ? (mode === 'startsWith' ? 'startsWith' : 'contains') : undefined;
+    const requestedMode: 'startsWith' | 'contains' | undefined = q
+      ? mode === 'startsWith'
+        ? 'startsWith'
+        : 'contains'
+      : undefined;
 
     if (!q) {
       const command = new ListObjectsV2Command({
@@ -277,7 +336,8 @@ export default async (fastify: FastifyInstance): Promise<void> => {
         MaxKeys: effectiveMaxKeys,
       });
       try {
-        const { Contents, CommonPrefixes, NextContinuationToken, IsTruncated } = await s3Client.send(command);
+        const { Contents, CommonPrefixes, NextContinuationToken, IsTruncated } =
+          await s3Client.send(command);
         buildResponse(reply, {
           objects: Contents,
           prefixes: CommonPrefixes,
@@ -311,12 +371,29 @@ export default async (fastify: FastifyInstance): Promise<void> => {
           ContinuationToken: continuationToken || undefined,
           MaxKeys: effectiveMaxKeys,
         });
-        const { Contents, CommonPrefixes, NextContinuationToken, IsTruncated } = await s3Client.send(command);
-        const { filteredObjects, filteredPrefixes } = applyContainsFilter(Contents, CommonPrefixes, qLower);
+        const { Contents, CommonPrefixes, NextContinuationToken, IsTruncated } =
+          await s3Client.send(command);
+        const { filteredObjects, filteredPrefixes } = applyFilter(
+          Contents,
+          CommonPrefixes,
+          qLower,
+          requestedMode,
+        );
 
-        const shouldBroaden = autoBroaden === 'true' && (!filteredObjects || filteredObjects.length === 0) && (!filteredPrefixes || filteredPrefixes.length === 0);
+        const shouldBroaden =
+          autoBroaden === 'true' &&
+          (!filteredObjects || filteredObjects.length === 0) &&
+          (!filteredPrefixes || filteredPrefixes.length === 0);
         if (shouldBroaden) {
-          const scan = await runContainsScan(s3Client, bucketName, decoded_prefix, continuationToken, qLower, effectiveMaxKeys);
+          const scan = await runContainsScan(
+            s3Client,
+            bucketName,
+            decoded_prefix,
+            continuationToken,
+            qLower,
+            effectiveMaxKeys,
+            requestedMode,
+          );
           const matches = addMatchMetadata(scan.aggregatedObjects, scan.aggregatedPrefixes, qLower);
           buildResponse(reply, {
             objects: scan.aggregatedObjects,
@@ -361,8 +438,30 @@ export default async (fastify: FastifyInstance): Promise<void> => {
       return;
     }
 
+    // 🔐 SECURITY: Rate limiting for contains searches (expensive operation)
+    const clientIp = req.ip || 'unknown';
+    const rateLimitKey = `contains-search:${clientIp}`;
+
+    if (checkRateLimit(rateLimitKey, RATE_LIMIT_CONTAINS_SEARCH, RATE_LIMIT_WINDOW_MS)) {
+      const retryAfter = getRateLimitResetTime(rateLimitKey);
+      reply.code(429).send({
+        error: 'RateLimitExceeded',
+        message: `Too many search requests. Maximum ${RATE_LIMIT_CONTAINS_SEARCH} per minute.`,
+        retryAfter,
+      });
+      return;
+    }
+
     try {
-      const scan = await runContainsScan(s3Client, bucketName, decoded_prefix, continuationToken, qLower, effectiveMaxKeys);
+      const scan = await runContainsScan(
+        s3Client,
+        bucketName,
+        decoded_prefix,
+        continuationToken,
+        qLower,
+        effectiveMaxKeys,
+        requestedMode || 'contains',
+      );
       const matches = addMatchMetadata(scan.aggregatedObjects, scan.aggregatedPrefixes, qLower);
       buildResponse(reply, {
         objects: scan.aggregatedObjects,
@@ -393,6 +492,10 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     }
   };
 
+  // List objects routes
+  // Note: bucketName does NOT need decodeURIComponent - it's validated to URL-safe [a-z0-9-]
+  // (see validateBucketName in utils/validation.ts). Fastify auto-decodes URL params anyway.
+  // Prefix IS base64-encoded and is decoded within handleListRequest via validateAndDecodePrefix.
   fastify.get('/:bucketName', async (req: FastifyRequest, reply: FastifyReply) => {
     const { bucketName } = req.params as any;
     await handleListRequest(req, reply, bucketName, undefined);
@@ -400,11 +503,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
 
   fastify.get('/:bucketName/:prefix', async (req: FastifyRequest, reply: FastifyReply) => {
     const { bucketName, prefix } = req.params as any;
-    let decoded_prefix = '';
-    if (prefix !== undefined) {
-      try { decoded_prefix = atob(prefix); } catch { decoded_prefix = ''; }
-    }
-    await handleListRequest(req, reply, bucketName, decoded_prefix);
+    await handleListRequest(req, reply, bucketName, prefix);
   });
 
   // Get an object to view it in the client
@@ -412,7 +511,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     logAccess(req);
     const { s3Client } = getS3Config();
     const { bucketName, encodedKey } = req.params as any;
-    const key = atob(encodedKey);
+    const key = base64Decode(encodedKey);
 
     const command = new GetObjectCommand({
       Bucket: bucketName,
@@ -423,7 +522,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
       const item = await s3Client.send(command);
       return item.Body;
     } catch (err: any) {
-      req.log.error(err);
+      req.log.error(sanitizeErrorForLogging(err));
       if (err instanceof S3ServiceException) {
         reply.status(err.$metadata.httpStatusCode || 500).send({
           error: err.name || 'S3ServiceException',
@@ -446,7 +545,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
       logAccess(req);
       const { s3Client } = getS3Config();
       const { bucketName, encodedKey } = req.params as any;
-      const key = atob(encodedKey);
+      const key = base64Decode(encodedKey);
       const fileName = key.split('/').pop();
 
       const command = new GetObjectCommand({
@@ -473,7 +572,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
 
         return reply;
       } catch (err: any) {
-        req.log.error(err);
+        req.log.error(sanitizeErrorForLogging(err));
         if (err instanceof S3ServiceException) {
           reply.status(err.$metadata.httpStatusCode || 500).send({
             error: err.name || 'S3ServiceException',
@@ -495,38 +594,70 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     logAccess(req);
     const { s3Client } = getS3Config();
     const { bucketName, encodedKey } = req.params as any;
-    const objectName = atob(encodedKey); // This can also be the prefix
-
-    // Check if the objectName is a real object or a prefix
-    const listCommand = new ListObjectsV2Command({
-      Bucket: bucketName,
-      Prefix: objectName,
-    });
+    const objectName = base64Decode(encodedKey); // This can also be the prefix
 
     try {
-      const listResponse = await s3Client.send(listCommand);
+      // Collect all objects to delete with pagination support
+      const objectsToDelete: { Key: string }[] = [];
+      let continuationToken: string | undefined;
 
-      if (listResponse.Contents && listResponse.Contents.length > 0) {
-        // If there are multiple objects with the prefix, delete all of them
-        const deleteParams = {
+      // Paginate through all objects with the given prefix
+      do {
+        const listCommand = new ListObjectsV2Command({
           Bucket: bucketName,
-          Delete: {
-            Objects: listResponse.Contents.map((item: any) => ({ Key: item.Key })),
-          },
-        };
+          Prefix: objectName,
+          ContinuationToken: continuationToken,
+          MaxKeys: 1000, // S3 maximum per request
+        });
 
-        const deleteCommand = new DeleteObjectsCommand(deleteParams);
-        await s3Client.send(deleteCommand);
-        reply.send({ message: 'Objects deleted successfully' });
-      } else {
-        // If it's a single object, delete it
+        const listResponse = await s3Client.send(listCommand);
+
+        if (listResponse.Contents && listResponse.Contents.length > 0) {
+          objectsToDelete.push(...listResponse.Contents.map((item: any) => ({ Key: item.Key })));
+        }
+
+        continuationToken = listResponse.NextContinuationToken;
+      } while (continuationToken);
+
+      // If no objects found, try deleting as a single object
+      if (objectsToDelete.length === 0) {
         const deleteCommand = new DeleteObjectCommand({
           Bucket: bucketName,
           Key: objectName,
         });
         await s3Client.send(deleteCommand);
         reply.send({ message: 'Object deleted successfully' });
+        return;
       }
+
+      // Delete objects in batches of 1000 (S3 limit for bulk delete)
+      const batchSize = 1000;
+      let totalDeleted = 0;
+
+      for (let i = 0; i < objectsToDelete.length; i += batchSize) {
+        const batch = objectsToDelete.slice(i, i + batchSize);
+
+        const deleteCommand = new DeleteObjectsCommand({
+          Bucket: bucketName,
+          Delete: {
+            Objects: batch,
+            Quiet: true, // Don't return deleted object details (reduces response size)
+          },
+        });
+
+        const deleteResponse = await s3Client.send(deleteCommand);
+        totalDeleted += batch.length;
+
+        // Log any errors (even in Quiet mode, errors are still returned)
+        if (deleteResponse.Errors && deleteResponse.Errors.length > 0) {
+          console.error(`[Delete] Batch ${i / batchSize + 1} had errors:`, deleteResponse.Errors);
+        }
+      }
+
+      reply.send({
+        message: `Successfully deleted ${totalDeleted} object(s)`,
+        count: totalDeleted,
+      });
     } catch (error: any) {
       if (error instanceof S3ServiceException) {
         reply.code(error.$metadata.httpStatusCode || 500).send({
@@ -544,7 +675,6 @@ export default async (fastify: FastifyInstance): Promise<void> => {
 
   // Progress tracking for uploads
   const uploadProgresses: UploadProgresses = {};
-  const uploadErrors: UploadErrors = {};
 
   fastify.get('/upload-progress/:encodedKey', (req: FastifyRequest, reply: FastifyReply) => {
     const { encodedKey } = req.params as any;
@@ -602,7 +732,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
       logAccess(req);
       const { bucketName, encodedKey } = req.params as any;
       const { s3Client } = getS3Config();
-      const key = atob(encodedKey);
+      const key = base64Decode(encodedKey);
 
       const data = await req.file({
         limits: {
@@ -637,16 +767,25 @@ export default async (fastify: FastifyInstance): Promise<void> => {
           abortController: abortUploadController.current as AbortController,
         });
 
-        upload.on('httpUploadProgress', (progress: any) => {
-          uploadProgresses[encodedKey] = { loaded: progress.loaded || 0, status: 'uploading' };
-        });
+        // Throttled progress tracking to prevent memory leaks
+        const PROGRESS_THRESHOLD = 1024 * 1024; // 1MB
+        let lastReported = 0;
 
-        await upload.done();
+        const throttledProgress = (loaded: number) => {
+          // Only update progress every 1MB
+          if (loaded - lastReported >= PROGRESS_THRESHOLD) {
+            uploadProgresses[encodedKey] = { loaded, status: 'uploading' };
+            lastReported = loaded;
+          }
+        };
+
+        // Use uploadWithCleanup to ensure event listeners are removed
+        await uploadWithCleanup(upload, throttledProgress);
         uploadProgresses[encodedKey] = { loaded: 0, status: 'completed' };
         abortUploadController.current = null;
         reply.send({ message: 'Object uploaded successfully' });
       } catch (e: any) {
-        console.log(e);
+        console.error('Upload failed:', sanitizeErrorForLogging(e));
         abortUploadController.current = null;
         delete uploadProgresses[encodedKey];
         if (e instanceof S3ServiceException) {
@@ -669,129 +808,282 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     },
   );
 
-  // Model files downloader
-  const retrieveModelFile = async (
-    s3Client: S3Client,
-    bucketName: string,
-    prefix: string,
-    modelName: string,
-    file: Sibling,
-  ) => {
-    try {
-      const auth_headers = { Authorization: `Bearer ${getHFConfig()}` };
-      const fileUrl = 'https://huggingface.co/' + modelName + '/resolve/main/' + file.rfilename;
+  // NOTE: Old HuggingFace import implementation removed to fix memory leaks
+  // Use POST /huggingface-import with transferQueue instead
 
-      const { httpProxy, httpsProxy } = getProxyConfig();
-      const axiosOptions: AxiosRequestConfig = { headers: auth_headers };
+  // Interface for HuggingFace import request
+  interface HuggingFaceImportRequest {
+    destinationType?: 's3' | 'local'; // Optional for backward compatibility, defaults to 's3'
+    localLocationId?: string; // Required if destinationType === 'local'
+    localPath?: string; // Required if destinationType === 'local'
+    bucketName?: string; // Required if destinationType === 's3'
+    modelId: string;
+    hfToken?: string;
+    prefix?: string;
+  }
 
-      if (fileUrl.startsWith('https://') && httpsProxy) {
-        axiosOptions.httpsAgent = new HttpsProxyAgent(httpsProxy);
-        axiosOptions.proxy = false;
-      } else if (fileUrl.startsWith('http://') && httpProxy) {
-        axiosOptions.httpAgent = new HttpProxyAgent(httpProxy);
-        axiosOptions.proxy = false;
+  // Helper function to download a HuggingFace file to S3 or local storage
+  async function downloadHuggingFaceFile(
+    fileJob: TransferFileJob,
+    destinationType: 's3' | 'local',
+    hfToken: string | undefined,
+    onProgress: (loaded: number) => void,
+    abortSignal: AbortSignal,
+  ): Promise<void> {
+    const { sourcePath, destinationPath } = fileJob;
+
+    // Memory profiling: Start of HF download
+    const fileName = path.basename(sourcePath);
+    logMemory(`[HF] Start download: ${fileName}`);
+
+    // Parse destination path
+    // Format: "s3:bucketName/path" or "local:locationId/path"
+    const colonIndex = destinationPath.indexOf(':');
+    if (colonIndex === -1) {
+      throw new Error(`Invalid destination path format: ${destinationPath}`);
+    }
+
+    const destRemainder = destinationPath.substring(colonIndex + 1);
+    const firstSlash = destRemainder.indexOf('/');
+    if (firstSlash === -1) {
+      throw new Error(`Invalid destination path format: ${destinationPath}`);
+    }
+
+    const destLoc = destRemainder.substring(0, firstSlash);
+    const destPath = destRemainder.substring(firstSlash + 1);
+
+    // Fetch from HuggingFace with native https module (zero buffering)
+    const { httpProxy, httpsProxy } = getProxyConfig();
+
+    // Recursive function to follow redirects
+    const makeRequest = (
+      currentUrl: string,
+      redirectCount = 0,
+    ): Promise<{ stream: Readable; contentLength: number }> => {
+      // Prevent infinite redirect loops
+      if (redirectCount > 10) {
+        return Promise.reject(new Error('Too many redirects (max 10)'));
       }
 
-      const response = await axios.head(fileUrl, axiosOptions);
-      const fileSize = parseInt(response.headers['content-length'] || '0');
+      const url = new URL(currentUrl);
 
-      const streamAxiosOptions: AxiosRequestConfig = { ...axiosOptions, responseType: 'stream' };
-      const fileStream = (await axios.get(fileUrl, streamAxiosOptions)).data;
-
-      const target = {
-        Bucket: bucketName,
-        Key: prefix + modelName + '/' + file.rfilename,
-        Body: fileStream,
+      // Prepare request options
+      const requestOptions: any = {
+        hostname: url.hostname,
+        port: url.port || (url.protocol === 'https:' ? 443 : 80),
+        path: url.pathname + url.search,
+        method: 'GET',
+        headers: hfToken ? { Authorization: `Bearer ${hfToken}` } : {},
+        signal: abortSignal, // Add abort signal to cancel HTTP request
       };
-      // Each model file download should have its own AbortController instance
-      const modelAbortController = new AbortController();
-      uploadProgresses[file.rfilename] = { loaded: 0, status: 'uploading', total: fileSize };
 
-      const upload = new Upload({
-        client: s3Client,
-        queueSize: 4, // optional concurrency configuration
-        leavePartsOnError: false, // optional manually handle dropped parts
-        params: target,
-        abortController: modelAbortController, // Use the dedicated controller
-      });
-
-      upload.on('httpUploadProgress', (progress: any) => {
-        uploadProgresses[file.rfilename] = {
-          loaded: progress.loaded || 0,
-          status: 'uploading',
-          total: fileSize,
-        };
-      });
-
-      await upload.done();
-      uploadProgresses[file.rfilename] = { loaded: fileSize, status: 'completed', total: fileSize };
-    } catch (e: any) {
-      if (e instanceof S3ServiceException) {
-        console.error(`S3 Error uploading ${file.rfilename}: ${e.name} - ${e.message}`);
-        uploadErrors[file.rfilename] = {
-          error: e.name || 'S3ServiceException',
-          message: e.message || `S3 Error uploading ${file.rfilename}: ${e.name} - ${e.message}`,
-        };
-      } else if (e.name === 'AbortError') {
-        console.error(`Upload aborted for ${file.rfilename}`);
-        uploadErrors[file.rfilename] = {
-          error: e.name || 'AbortError',
-          message: e.message || `Upload aborted for ${file.rfilename}`,
-        };
-      } else {
-        console.error(`Error retrieving/uploading ${file.rfilename}: ${e.message}`);
-        uploadErrors[file.rfilename] = {
-          error: e.name || 'Unknown error',
-          message: e.message || `Error retrieving/uploading ${file.rfilename}: ${e.message}`,
-        };
+      // Add proxy agent if configured
+      if (url.protocol === 'https:' && httpsProxy) {
+        requestOptions.agent = new HttpsProxyAgent(httpsProxy);
+      } else if (url.protocol === 'http:' && httpProxy) {
+        requestOptions.agent = new HttpProxyAgent(httpProxy);
       }
-      delete uploadProgresses[file.rfilename]; // Ensure progress is cleared on error
-      // Optionally, re-throw or handle more specifically if a single file failure should stop the batch
-    }
-  };
 
-  // Queue manager for model files
-  const startModelImport = async (
-    modelFiles: Siblings,
-    s3Client: S3Client,
-    bucketName: string,
-    prefix: string,
-    modelName: string,
-  ) => {
-    modelFiles.forEach((file: Sibling) => {
-      uploadProgresses[file.rfilename] = { loaded: 0, status: 'queued', total: 0 };
-    });
-    const limit = pLimit(getMaxConcurrentTransfers());
-    const promises = modelFiles.map((file: Sibling) =>
-      limit(() => retrieveModelFile(s3Client, bucketName, prefix, modelName, file)),
-    );
+      return new Promise<{ stream: Readable; contentLength: number }>((resolve, reject) => {
+        const req = (url.protocol === 'https:' ? httpsRequest : httpRequest)(
+          requestOptions,
+          (res) => {
+            const statusCode = res.statusCode || 0;
+
+            // Handle redirects (301, 302, 307, 308)
+            if (statusCode >= 300 && statusCode < 400) {
+              const location = res.headers.location;
+              if (!location) {
+                reject(new Error(`Redirect response missing Location header (${statusCode})`));
+                return;
+              }
+
+              // Consume redirect response body to free memory
+              res.resume();
+
+              // Resolve relative URLs against current URL (e.g., '/api/cache/file')
+              const redirectUrl = new URL(location, currentUrl);
+
+              // Follow redirect recursively
+              makeRequest(redirectUrl.href, redirectCount + 1)
+                .then(resolve)
+                .catch(reject);
+              return;
+            }
+
+            // Handle success (200)
+            if (statusCode === 200) {
+              const contentLength = parseInt(res.headers['content-length'] || '0', 10);
+              resolve({ stream: res, contentLength });
+              return;
+            }
+
+            // Handle errors (non-200, non-redirect)
+            reject(
+              new Error(
+                `HTTP request failed: ${statusCode} ${res.statusMessage || 'Unknown error'}`,
+              ),
+            );
+          },
+        );
+
+        req.on('error', reject);
+        req.end();
+      });
+    };
+
+    // Make initial request (will follow redirects automatically)
+    const { stream, contentLength } = await makeRequest(sourcePath);
+
+    fileJob.size = contentLength;
+
+    // Memory profiling: HTTP response received
+    const sizeInMB = (contentLength / (1024 * 1024)).toFixed(2);
+    logMemory(`[HF] Response received: ${fileName} (${sizeInMB} MB)`);
+
+    // Track progress with throttling to prevent memory leaks
+    const progressTransform = createProgressTransform(onProgress);
+
+    // Add abort handling to progress transform
+    if (abortSignal) {
+      const abortHandler = () => {
+        progressTransform.destroy(new Error('Transfer cancelled'));
+      };
+      abortSignal.addEventListener('abort', abortHandler);
+      progressTransform.on('close', () => {
+        abortSignal.removeEventListener('abort', abortHandler);
+      });
+    }
+
+    // Memory profiling: Before pipeline setup
+    logMemory(`[HF] Before pipeline: ${fileName}`);
+
     try {
-      await Promise.all(promises);
-    } catch (batchError: any) {
-      // This catch block might be hit if p-limit itself throws or if a promise reject isn't caught inside retrieveModelFile
-      console.error('Error during model import batch:', batchError);
-      // Decide on how to update overall status; individual errors are logged in retrieveModelFile
-    }
-  };
+      // Write to destination
+      if (destinationType === 's3') {
+        // Upload to S3
+        const { s3Client } = getS3Config();
 
-  // Import model from Hugging Face
-  fastify.get(
-    '/hf-import/:bucketName/:encodedPrefix/:encodedModelName',
+        // Use PassThrough stream to combine axios stream with progress tracking
+        // while maintaining backpressure control
+        const passThrough = new PassThrough({
+          highWaterMark: 64 * 1024, // 64KB chunks - prevents excessive buffering
+        });
+
+        // Pipeline with native backpressure: http → progress → passthrough
+        const pipelinePromise = pipelineAsync(stream, progressTransform, passThrough);
+
+        // Upload reads from passthrough with proper backpressure
+        const upload = new Upload({
+          client: s3Client,
+          params: {
+            Bucket: destLoc,
+            Key: destPath,
+            Body: passThrough,
+          },
+        });
+
+        // Wait for both to complete
+        await Promise.all([upload.done(), pipelinePromise]);
+
+        // Memory profiling: S3 upload complete
+        logMemory(`[HF] S3 upload complete: ${fileName}`);
+      } else {
+        // Write to local storage
+        // First, ensure parent directory structure exists
+        const parentRelativePath = path.dirname(destPath);
+
+        // Get validated base path
+        const basePath = await validatePath(destLoc, '.');
+
+        // Construct parent absolute path
+        const normalizedParent = path.normalize(parentRelativePath || '.');
+        const parentAbsolutePath = path.join(basePath, normalizedParent);
+
+        // Security check: ensure parent doesn't escape base
+        if (
+          !parentAbsolutePath.startsWith(basePath + path.sep) &&
+          parentAbsolutePath !== basePath
+        ) {
+          throw new SecurityError(`Path escapes allowed directory: ${parentRelativePath}`);
+        }
+
+        // Create directory structure recursively
+        await fs.mkdir(parentAbsolutePath, { recursive: true });
+
+        // Now validate the full file path (will succeed because parent exists)
+        const absolutePath = await validatePath(destLoc, destPath);
+
+        // Stream to file with native backpressure
+        await pipelineAsync(stream, progressTransform, createWriteStream(absolutePath));
+
+        // Memory profiling: Local file write complete
+        logMemory(`[HF] Local write complete: ${fileName}`);
+      }
+    } catch (error) {
+      // Memory profiling: Error occurred
+      logMemory(`[HF] Error during transfer: ${fileName}`);
+
+      // Critical: Destroy streams on error to prevent memory leaks
+      stream.destroy();
+      progressTransform.destroy();
+      throw error;
+    }
+  }
+
+  // New POST route for HuggingFace import with local storage support
+  fastify.post<{ Body: HuggingFaceImportRequest }>(
+    '/huggingface-import',
     async (req: FastifyRequest, reply: FastifyReply) => {
       logAccess(req);
-      const { bucketName, encodedPrefix, encodedModelName } = req.params as any;
-      let prefix = atob(encodedPrefix);
-      prefix = prefix === 'there_is_no_prefix' ? '' : prefix;
-      const modelName = atob(encodedModelName);
-      const { s3Client } = getS3Config();
-      let modelInfo: any = {};
+      const body = req.body as HuggingFaceImportRequest;
+      const {
+        destinationType = 's3', // Default to 's3' for backward compatibility
+        localLocationId,
+        localPath,
+        bucketName,
+        modelId,
+        hfToken: requestHfToken,
+        prefix,
+      } = body;
+
+      // Use HF token from request or fall back to configured token
+      const hfToken = requestHfToken || getHFConfig();
+
+      // Validate destination parameters
+      if (destinationType === 's3' && !bucketName) {
+        return reply.code(400).send({
+          error: 'ValidationError',
+          message: 'bucketName is required for S3 destination',
+        });
+      }
+
+      if (destinationType === 'local') {
+        if (!localLocationId || localPath === undefined) {
+          return reply.code(400).send({
+            error: 'ValidationError',
+            message: 'localLocationId and localPath are required for local destination',
+          });
+        }
+
+        // Validate local path
+        try {
+          await validatePath(localLocationId, localPath);
+        } catch (error: any) {
+          return reply.code(400).send({
+            error: 'ValidationError',
+            message: `Invalid local storage path: ${error.message}`,
+          });
+        }
+      }
+
+      // Fetch model info from HuggingFace
+      let modelInfo: any;
       try {
         const { httpProxy, httpsProxy } = getProxyConfig();
-        const modelInfoUrl = 'https://huggingface.co/api/models/' + modelName + '?';
+        const modelInfoUrl = 'https://huggingface.co/api/models/' + modelId;
         const axiosOptions: AxiosRequestConfig = {
-          headers: {
-            Authorization: `Bearer ${getHFConfig()}`,
-          },
+          headers: hfToken ? { Authorization: `Bearer ${hfToken}` } : {},
         };
 
         if (modelInfoUrl.startsWith('https://') && httpsProxy) {
@@ -801,24 +1093,23 @@ export default async (fastify: FastifyInstance): Promise<void> => {
           axiosOptions.httpAgent = new HttpProxyAgent(httpProxy);
           axiosOptions.proxy = false;
         }
+
         modelInfo = await axios.get(modelInfoUrl, axiosOptions);
       } catch (error: any) {
-        reply.code(error.response?.status || 500).send({
-          error: error.response?.data?.error || 'Hugging Face API error',
-          message: error.response?.data?.error || 'Error fetching model info from Hugging Face',
+        return reply.code(error.response?.status || 500).send({
+          error: error.response?.data?.error || 'HuggingFace API error',
+          message: error.response?.data?.error || 'Error fetching model info from HuggingFace',
         });
-        return;
       }
+
+      // Check if model is gated and user is authorized
       const modelGated = modelInfo.data.gated;
-      let authorizedUser = true;
-      if (modelGated !== false) {
+      if (modelGated !== false && hfToken) {
         try {
           const { httpProxy, httpsProxy } = getProxyConfig();
-          const whoAmIUrl = 'https://huggingface.co/api/whoami-v2?';
+          const whoAmIUrl = 'https://huggingface.co/api/whoami-v2';
           const axiosOptions: AxiosRequestConfig = {
-            headers: {
-              Authorization: `Bearer ${getHFConfig()}`,
-            },
+            headers: { Authorization: `Bearer ${hfToken}` },
           };
 
           if (whoAmIUrl.startsWith('https://') && httpsProxy) {
@@ -828,109 +1119,69 @@ export default async (fastify: FastifyInstance): Promise<void> => {
             axiosOptions.httpAgent = new HttpProxyAgent(httpProxy);
             axiosOptions.proxy = false;
           }
+
           await axios.get(whoAmIUrl, axiosOptions);
         } catch (error) {
-          authorizedUser = false;
-        }
-      }
-      if (!authorizedUser) {
-        reply
-          .code(401) // Changed to 401 Unauthorized
-          .send({
+          return reply.code(401).send({
             error: 'Unauthorized',
             message:
-              'This model requires a valid HuggingFace token to be downloaded, or you are not authorized. Check your settings.',
+              'This model requires a valid HuggingFace token to be downloaded, or you are not authorized.',
           });
-        return;
-      } else {
-        const modelFiles: Siblings = modelInfo.data.siblings;
-        startModelImport(modelFiles, s3Client, bucketName, prefix, modelName);
-        reply.send({ message: 'Model import started' });
+        }
+      } else if (modelGated !== false && !hfToken) {
+        return reply.code(401).send({
+          error: 'Unauthorized',
+          message: 'This model is gated and requires a HuggingFace token.',
+        });
       }
+
+      // Get model files
+      const modelFiles: Siblings = modelInfo.data.siblings;
+
+      // Create transfer jobs
+      const files = modelFiles.map((file) => {
+        const fileUrl = `https://huggingface.co/${modelId}/resolve/main/${file.rfilename}`;
+
+        // Normalize paths to remove trailing slashes to avoid double-slash issues
+        const normalizedPrefix = prefix ? prefix.replace(/\/$/, '') : '';
+        const normalizedLocalPath = localPath ? localPath.replace(/\/$/, '') : '';
+
+        const destinationPath =
+          destinationType === 's3'
+            ? `s3:${bucketName}/${normalizedPrefix ? `${normalizedPrefix}/` : ''}${modelId}/${
+                file.rfilename
+              }`
+            : `local:${localLocationId}/${
+                normalizedLocalPath ? `${normalizedLocalPath}/` : ''
+              }${modelId}/${file.rfilename}`;
+
+        return {
+          sourcePath: fileUrl,
+          destinationPath,
+          size: 0, // Will be tracked during transfer
+        };
+      });
+
+      // Queue transfer job
+      const jobId = transferQueue.queueJob(
+        'huggingface',
+        files,
+        async (fileJob, onProgress, abortSignal) => {
+          await downloadHuggingFaceFile(fileJob, destinationType, hfToken, onProgress, abortSignal);
+        },
+      );
+
+      // Return job ID and SSE URL
+      // SSE endpoint is at /api/transfer/progress/:jobId
+      // Return relative path (frontend prepends backend_api_url which includes /api)
+      return reply.send({
+        message: 'Model import started',
+        jobId,
+        sseUrl: `/transfer/progress/${jobId}`,
+      });
     },
   );
 
-  fastify.get('/import-model-progress', (req: FastifyRequest, reply: FastifyReply) => {
-    reply.raw.setHeader('Access-Control-Allow-Origin', '*');
-    reply.raw.setHeader(
-      'Access-Control-Allow-Headers',
-      'Origin, X-Requested-With, Content-Type, Accept',
-    );
-    reply.raw.setHeader('Content-Type', 'text/event-stream');
-    reply.raw.setHeader('Cache-Control', 'no-cache');
-    reply.raw.setHeader('Connection', 'keep-alive');
-
-    const sendEvent = (data: any) => {
-      reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
-    };
-
-    const interval = setInterval(() => {
-      if (Object.keys(uploadProgresses).length > 0) {
-        sendEvent(uploadProgresses);
-      }
-
-      if (Object.keys(uploadErrors).length > 0) {
-        sendEvent(uploadErrors);
-        // Clear errors after sending
-        Object.keys(uploadErrors).forEach((key) => delete uploadErrors[key]);
-      }
-
-      const allCompleted = Object.keys(uploadProgresses).map(k => uploadProgresses[k]).every(
-        (item: UploadProgress) => item.status === 'completed',
-      );
-      const noActiveUploads = Object.keys(uploadProgresses).map(k => uploadProgresses[k]).every(
-        (item: UploadProgress) => item.status === 'completed' || item.status === 'idle', // Assuming 'idle' means error/not started
-      );
-
-      // End stream if all are completed OR if there are no active/queued uploads left (implying errors might have occurred)
-      if (Object.keys(uploadProgresses).length > 0 && noActiveUploads) {
-        // Check if any were not completed to decide if it was a full success
-        const anyNotCompleted = Object.keys(uploadProgresses).map(k => uploadProgresses[k]).some(
-          (item: UploadProgress) => item.status !== 'completed',
-        );
-        if (anyNotCompleted) {
-          console.log('Model import process finished, but some files may have failed.');
-        } else {
-          console.log('All model uploads completed successfully.');
-        }
-
-        // Send last errors if any
-        if (Object.keys(uploadErrors).length > 0) {
-          sendEvent(uploadErrors);
-          // Clear errors after sending
-          Object.keys(uploadErrors).forEach((key) => delete uploadErrors[key]);
-        }
-
-        // Clear the interval and end the stream
-        clearInterval(interval);
-        Object.keys(uploadProgresses).forEach((key) => delete uploadProgresses[key]);
-        reply.raw.end();
-        return;
-      }
-      // If there are no progresses at all, and it wasn't just cleared, also end.
-      if (Object.keys(uploadProgresses).length === 0 && !allCompleted) {
-        // This case might happen if import started but failed before any progress was made, or client disconnected early
-        // Or if all were completed and cleared in a previous tick.
-        // To prevent spamming end(), we rely on the check above mostly.
-        // However, if it becomes empty and not due to completion, we should also stop.
-        // This logic might need refinement based on how `startModelImport` signals overall completion/failure.
-        // For now, if it's empty and not all were marked completed in a prior step, assume it's done (possibly with errors).
-        console.log('Model import progress stream closing due to no active or pending tasks.');
-        clearInterval(interval);
-        reply.raw.end();
-      }
-    }, 1000);
-
-    // Handle client disconnect
-    req.raw.on('close', () => {
-      console.log('Client disconnected from model import progress.');
-      Object.keys(uploadProgresses).forEach((key) => {
-        // Here, we don't try to abort S3 uploads as the AbortController was per-file and might be out of scope
-        // or the upload might have finished/failed already. Clearing progress is the main action.
-        delete uploadProgresses[key];
-      });
-      clearInterval(interval);
-      // reply.raw.end() is implicitly handled by connection close
-    });
-  });
+  // NOTE: Old GET /hf-import and /import-model-progress routes removed to fix memory leaks
+  // Use POST /huggingface-import with /transfer/progress/:jobId instead
 };

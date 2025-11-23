@@ -1,6 +1,6 @@
 {  "compilerOptions": {
     "baseUrl": ".",
-    "rootDir": ".",
+    "rootDir": "src",
     "outDir": "dist",
     "module": "esnext",
     "target": "ES2020",
@@ -30,14 +30,14 @@
       "@assets/*": ["node_modules/@patternfly/react-core/dist/styles/assets/*"]
     },
     "importHelpers": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "types": ["react", "react-dom"]
   },
   "include": [
-    "**/*.ts",
-    "**/*.tsx",
-    "**/*.jsx",
-    "**/*.js",
-    "**/.eslintrc.js"
+    "src/**/*"
   ],
-  "exclude": ["node_modules"]
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
 }
