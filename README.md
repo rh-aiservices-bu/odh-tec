@@ -86,3 +86,4 @@ All the file transfers (computer->backend->S3 or Huggingface->S3) are fully stre
 - From the root folder of the repo, run `npm install` to install all the required packages both for the frontend and the backend.
 - In both `backend` and `frontend` folders, copy the `.env.example` files to `.env` and adjust the values in the `backend` one to your liking.
 - Launch the application in development mode with `npm run dev`.
+- **Testing with URL path prefix**: Set `NB_PREFIX=/my-app` in `.env` to test path-based routing locally (useful for Gateway API, Ingress testing). See [Development Workflow](docs/development/development-workflow.md#testing-with-url-path-prefix) for details.

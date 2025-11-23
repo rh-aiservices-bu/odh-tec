@@ -1,4 +1,4 @@
-export default {
+module.exports = {
   // tells eslint to use the TypeScript parser
   "parser": "@typescript-eslint/parser",
   // tell the TypeScript parser that we want to use JSX syntax
@@ -67,7 +67,15 @@ export default {
     "prettier/prettier": "off",
     "import/no-unresolved": "off",
     "import/extensions": "off",
-    "react/prop-types": "off"
+    "react/prop-types": "off",
+    "rulesdir/forbid-pf-relative-imports": "off",
+    "@typescript-eslint/no-unused-vars": [
+      "error",
+      {
+        "argsIgnorePattern": "^_",
+        "varsIgnorePattern": "^_"
+      }
+    ]
   },
   "env": {
     "browser": true,

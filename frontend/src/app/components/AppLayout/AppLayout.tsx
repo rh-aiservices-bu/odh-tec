@@ -23,6 +23,7 @@ import {
   EmptyStateBody,
   EmptyStateVariant,
   Flex,
+  FlexItem,
   Masthead,
   MastheadBrand,
   MastheadContent,
@@ -31,6 +32,10 @@ import {
   MastheadToggle,
   MenuToggle,
   MenuToggleElement,
+  Modal,
+  ModalBody,
+  ModalFooter,
+  ModalHeader,
   Nav,
   NavExpandable,
   NavItem,
@@ -57,9 +62,6 @@ import {
   ToolbarGroup,
   ToolbarItem
 } from '@patternfly/react-core';
-import {
-  Modal
-} from '@patternfly/react-core/deprecated';
 import { BarsIcon, EllipsisVIcon, QuestionCircleIcon, SearchIcon } from '@patternfly/react-icons';
 import MoonIcon from '@patternfly/react-icons/dist/esm/icons/moon-icon';
 import SunIcon from '@patternfly/react-icons/dist/esm/icons/sun-icon';
@@ -70,6 +72,12 @@ import { NavLink, useLocation } from 'react-router-dom';
 import { v4 as uuidv4 } from 'uuid';
 import { supportedLngs } from '../../../i18n/config';
 import Emitter from '../../utils/emitter';
+import forkLogo from '../../assets/bgimages/fork.svg';
+import forkLogoWhite from '../../assets/bgimages/fork-white.svg';
+import githubLogo from '../../assets/bgimages/github-mark.svg';
+import githubLogoWhite from '../../assets/bgimages/github-mark-white.svg';
+import starLogo from '../../assets/bgimages/star.svg';
+import starLogoWhite from '../../assets/bgimages/star-white.svg';
 
 interface IAppLayout {
   children: React.ReactNode;
@@ -79,11 +87,35 @@ const AppLayout: React.FunctionComponent<IAppLayout> = ({ children }) => {
   // Theme
   const [isDarkTheme, setIsDarkTheme] = React.useState(false);
 
+  React.useEffect(() => {
+    const savedTheme = localStorage.getItem('theme');
+    const prefersDark = savedTheme === 'dark';
+    setIsDarkTheme(prefersDark);
+    if (prefersDark) {
+      document.documentElement.classList.add('pf-v6-theme-dark');
+    }
+  }, []);
+
+  const handleThemeToggle = (checked: boolean) => {
+    setIsDarkTheme(checked);
+    if (checked) {
+      document.documentElement.classList.add('pf-v6-theme-dark');
+      localStorage.setItem('theme', 'dark');
+    } else {
+      document.documentElement.classList.remove('pf-v6-theme-dark');
+      localStorage.setItem('theme', 'light');
+    }
+  };
+
   // Language
   const [selectedLanguage, setSelectedLanguage] = React.useState('en');
   const onChangeLanguage = (_event: React.FormEvent<HTMLSelectElement>, language: string) => {
     setSelectedLanguage(language);
   };
+
+  // Git
+  const [repoStars, setRepoStars] = React.useState<number | null>(null);
+  const [repoForks, setRepoForks] = React.useState<number | null>(null);
 
   //i18n
   const { t, i18n } = useTranslation();
@@ -91,7 +123,7 @@ const AppLayout: React.FunctionComponent<IAppLayout> = ({ children }) => {
     i18n.changeLanguage(selectedLanguage);
   }, [selectedLanguage]);
 
-  // User
+/*   // User - Removed, no access to user in RHOAI 3
   const { userName, setUserName } = useUser();
 
   React.useEffect(() => {
@@ -112,6 +144,20 @@ const AppLayout: React.FunctionComponent<IAppLayout> = ({ children }) => {
       }
     }
     fetchUserInfo();
+  }, []); */
+
+  // Fetch GitHub stars and forks
+  React.useEffect(() => {
+    axios
+      .get('https://api.github.com/repos/rh-aiservices-bu/odh-tec')
+      .then((response) => {
+        setRepoStars(response.data.stargazers_count);
+        setRepoForks(response.data.forks_count);
+      })
+      .catch((error) => {
+        // eslint-disable-next-line no-console
+        console.error('Failed to fetch GitHub stars:', error);
+      });
   }, []);
 
   // Notifications
@@ -126,8 +172,6 @@ const AppLayout: React.FunctionComponent<IAppLayout> = ({ children }) => {
   }
 
   const maxDisplayedAlerts = 3;
-  const minAlerts = 0;
-  const maxAlerts = 100;
   const alertTimeout = 8000;
 
   const [isDrawerExpanded, setDrawerExpanded] = React.useState(false);
@@ -310,22 +354,6 @@ const AppLayout: React.FunctionComponent<IAppLayout> = ({ children }) => {
     setDrawerExpanded(true);
   };
 
-  const onMaxDisplayedAlertsMinus = () => {
-    setMaxDisplayed(normalizeAlertsNumber(maxDisplayed - 1));
-  };
-
-  const onMaxDisplayedAlertsChange = (event: any) => {
-    setMaxDisplayed(normalizeAlertsNumber(Number(event.target.value)));
-  };
-
-  const onMaxDisplayedAlertsPlus = () => {
-    setMaxDisplayed(normalizeAlertsNumber(maxDisplayed + 1));
-  };
-
-  const normalizeAlertsNumber = (value: number) => Math.max(Math.min(value, maxAlerts), minAlerts);
-
-  const alertButtonStyle = { marginRight: '8px', marginTop: '8px' };
-
   const notificationBadge = (
     <ToolbarItem>
       <NotificationBadge
@@ -428,13 +456,16 @@ const AppLayout: React.FunctionComponent<IAppLayout> = ({ children }) => {
   // Navigation
   const location = useLocation();
 
-  const renderNavItem = (route: IAppRoute, index: number) => (
-    <NavItem key={`${route.label}-${index}`} id={`${route.label}-${index}`} isActive={route.path.split('/')[1] === location.pathname.split('/')[1]} className='navitem-flex'>
-      <NavLink to={route.path} className={route.path !== '#' ? '' : 'disabled-link'}>
-        {t(route.label as string)}
-      </NavLink>
-    </NavItem>
-  );
+  const renderNavItem = (route: IAppRoute, index: number) => {
+    const navTarget = route.navPath ?? route.path;
+    return (
+      <NavItem key={`${route.label}-${index}`} id={`${route.label}-${index}`} isActive={route.path.split('/')[1] === location.pathname.split('/')[1]} className='navitem-flex'>
+        <NavLink to={navTarget} className={navTarget !== '#' ? '' : 'disabled-link'}>
+          {t(route.label as string)}
+        </NavLink>
+      </NavItem>
+    );
+  };
 
   const renderNavGroup = (group: IAppRouteGroup, groupIndex: number) => (
     <NavExpandable
@@ -469,27 +500,96 @@ const AppLayout: React.FunctionComponent<IAppLayout> = ({ children }) => {
 
   const Sidebar = (
     <PageSidebar  >
-      <PageSidebarBody isFilled>
+      <PageSidebarBody isFilled style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
         {Navigation}
+        <aside
+          role="complementary"
+          style={{ marginTop: 'auto', padding: '1rem', textAlign: 'center' }}
+        >
+          <Content component={ContentVariants.small}>
+            App by&nbsp;
+            <a href="http://red.ht/cai-team" target="_blank" rel="noreferrer">
+              red.ht/cai team
+            </a>
+            <br />
+            version 2.1.0
+            <br />
+            <Flex direction={{ default: 'column' }} style={{ width: '100%', alignItems: 'center' }}>
+              <FlexItem style={{ marginBottom: '0rem' }}>
+                <Flex direction={{ default: 'row' }} alignItems={{ default: 'alignItemsCenter' }}>
+                  <FlexItem>
+                    <Content
+                      component={ContentVariants.a}
+                      href="https://github.com/rh-aiservices-bu/odh-tec"
+                      target="_blank"
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        marginTop: '0.5rem',
+                        fontSize: 'var(--pf-t--global--font--size--xs)',
+                      }}
+                    >
+                      <img
+                        src={isDarkTheme ? githubLogoWhite : githubLogo}
+                        alt={"GitHub logo"}
+                        style={{ height: '20px', marginRight: '0.5rem' }}
+                      />
+                      {"Source on GitHub"}
+                    </Content>
+                  </FlexItem>
+                </Flex>
+              </FlexItem>
+              <FlexItem>
+                <Flex direction={{ default: 'row' }}>
+                  <FlexItem style={{ alignmentBaseline: 'middle' }}>
+                    {repoStars !== null && (
+                      <>
+                        <img
+                          src={isDarkTheme ? starLogoWhite : starLogo}
+                          alt=""
+                          style={{
+                            height: '15px',
+                            marginRight: '0.5rem',
+                            verticalAlign: 'text-top',
+                          }}
+                          aria-hidden="true"
+                        />
+                        <span className="pf-v6-screen-reader">{t('ui.footer.stars')}</span>
+                      </>
+                    )}
+                    {repoStars !== null ? `${repoStars}` : ''}
+                  </FlexItem>
+                  <FlexItem>
+                    {repoForks !== null && (
+                      <>
+                        <img
+                          src={isDarkTheme ? forkLogoWhite : forkLogo}
+                          alt=""
+                          style={{
+                            height: '15px',
+                            marginRight: '0.5rem',
+                            verticalAlign: 'text-top',
+                          }}
+                          aria-hidden="true"
+                        />
+                        <span className="pf-v6-screen-reader">{t('ui.footer.forks')}</span>
+                      </>
+                    )}
+                    {repoForks !== null ? `${repoForks}` : ''}
+                  </FlexItem>
+                </Flex>
+              </FlexItem>
+            </Flex>
+          </Content>
+        </aside>
       </PageSidebarBody>
     </PageSidebar>
   );
 
 
   // Header
-  const HeaderTools = ({
-    isDarkTheme,
-    setIsDarkTheme
-  }) => {
-
-    const toggleDarkTheme = (_evt, selected) => {
-      const darkThemeToggleClicked = !selected === isDarkTheme;
-      const htmlElement = document.querySelector('html');
-      if (htmlElement) {
-        htmlElement.classList.toggle('pf-v6-theme-dark', darkThemeToggleClicked);
-      }
-      setIsDarkTheme(darkThemeToggleClicked);
-    };
+  const HeaderTools = () => {
 
     const [isLanguageDropdownOpen, setLanguageDropdownOpen] = React.useState(false);
 
@@ -503,13 +603,13 @@ const AppLayout: React.FunctionComponent<IAppLayout> = ({ children }) => {
                   aria-label="light theme toggle"
                   icon={<SunIcon />}
                   isSelected={!isDarkTheme}
-                  onChange={toggleDarkTheme}
+                  onClick={() => handleThemeToggle(false)}
                 />
                 <ToggleGroupItem
                   aria-label="dark theme toggle"
                   icon={<MoonIcon />}
                   isSelected={isDarkTheme}
-                  onChange={toggleDarkTheme}
+                  onClick={() => handleThemeToggle(true)}
                 />
               </ToggleGroup>
             </ToolbarItem>
@@ -552,6 +652,7 @@ const AppLayout: React.FunctionComponent<IAppLayout> = ({ children }) => {
                 <Button aria-label="Help" variant={ButtonVariant.plain} icon={<QuestionCircleIcon />} />
               </Popover>
             </ToolbarItem>
+            {/*
             <ToolbarItem>
               <Flex direction={{ default: 'column' }} alignItems={{ default: 'alignItemsCenter' }} justifyContent={{ default: 'justifyContentCenter' }} className='pf-v5-global--spacer--md'>
                 <Content component={ContentVariants.p}>
@@ -562,6 +663,7 @@ const AppLayout: React.FunctionComponent<IAppLayout> = ({ children }) => {
             <ToolbarItem>
               <Avatar src={imgAvatar} alt="" isBordered className='avatar' />
             </ToolbarItem>
+            */}
           </ToolbarGroup>
         </ToolbarContent>
       </Toolbar>
@@ -586,7 +688,7 @@ const AppLayout: React.FunctionComponent<IAppLayout> = ({ children }) => {
         </MastheadBrand>
       </MastheadMain>
       <MastheadContent>
-        <HeaderTools isDarkTheme={isDarkTheme} setIsDarkTheme={setIsDarkTheme} />
+        <HeaderTools/>
       </MastheadContent>
     </Masthead>
   );
@@ -652,20 +754,22 @@ const AppLayout: React.FunctionComponent<IAppLayout> = ({ children }) => {
         {alerts.slice(0, maxDisplayed)}
       </AlertGroup>
       <Modal
-        title={"Disclaimer"}
-        titleIconVariant="info"
-        className="bucket-modal"
+        className="standard-modal"
         isOpen={isDisclaimerModalOpen}
         onClose={handleDisclaimerModalToggle}
-        actions={[
+      >
+        <ModalHeader title="Disclaimer" titleIconVariant="info" />
+        <ModalBody>
+          <Content component={ContentVariants.p}>
+            This application is provided &quot;as is&quot; under a MIT licence, without any warranty of any kind.<br />
+            Please refer to the <a href='https://github.com/rh-aiservices-bu/odh-tec/blob/main/LICENSE' target='_blank' rel="noreferrer">license file</a> for more details
+          </Content>
+        </ModalBody>
+        <ModalFooter>
           <Button key="accept" variant="primary" onClick={saveDisclaimerStatus}>
             Accept
           </Button>
-        ]}>
-          <Content component={ContentVariants.p}>
-            This application is provided "as is" under a MIT licence, without any warranty of any kind.<br />
-            Please refer to the <a href='https://github.com/opendatahub-io-contrib/odh-tec/blob/main/LICENSE' target='_blank'>license file</a> for more details
-          </Content>
+        </ModalFooter>
       </Modal>
     </Page>
   );

@@ -1,17 +1,17 @@
 {
   "name": "odh-tec",
-  "version": "2.0.7",
+  "version": "2.1.0",
   "description": "Open Data Hub Tools & Extensions Companion",
   "author": "",
   "license": "MIT",
   "private": true,
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/opendatahub-io-contrib/odh-tec.git"
+    "url": "git+https://github.com/rh-aiservices.bu/odh-tec.git"
   },
   "homepage": "",
   "bugs": {
-    "url": "https://github.com/opendatahub-io-contrib/odh-tec/issues"
+    "url": "https://github.com/rh-aiservices.bu/odh-tec/issues"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -23,7 +23,7 @@
     "dev": "run-p -l dev:*",
     "dev:backend": "cd ./backend && npm run start:dev",
     "dev:frontend": "cd ./frontend && npm run start:dev",
-    "format": "prettier --write \"backend/**/*.ts\" \"frontend/**/*.ts\" \"frontend/**/*.tsx\"",
+    "format": "prettier --write \"{docs/**,*.{js,jsx,ts,tsx,json,css,scss,md}}\"",
     "make": "make",
     "make:build": "make build",
     "make:deploy": "make deploy",

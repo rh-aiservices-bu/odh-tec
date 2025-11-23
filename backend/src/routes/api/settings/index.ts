@@ -11,10 +11,14 @@ import {
   updateHFConfig,
   getMaxConcurrentTransfers,
   updateMaxConcurrentTransfers,
+  getMaxFilesPerPage,
+  updateMaxFilesPerPage,
   getProxyConfig,
   updateProxyConfig,
   initializeS3Client,
 } from '../../../utils/config';
+import { updateTransferQueueConcurrency } from '../../../utils/transferQueue';
+import { sanitizeErrorForLogging } from '../../../utils/errorLogging';
 import { HttpProxyAgent } from 'http-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { NodeHttpHandler } from '@aws-sdk/node-http-handler';
@@ -88,16 +92,18 @@ export default async (fastify: FastifyInstance): Promise<void> => {
       if (httpProxy) {
         try {
           agentConfig.httpAgent = new HttpProxyAgent<string>(httpProxy);
-        } catch (e) {
-          console.error('Failed to create HttpProxyAgent:', e);
+        } catch (e: any) {
+          // Log only error message, not full error object which may contain agent config
+          console.error('Failed to create HttpProxyAgent:', e?.message || String(e));
         }
       }
 
       if (httpsProxy) {
         try {
           agentConfig.httpsAgent = new HttpsProxyAgent<string>(httpsProxy);
-        } catch (e) {
-          console.error('Failed to create HttpsProxyAgent:', e);
+        } catch (e: any) {
+          // Log only error message, not full error object which may contain agent config
+          console.error('Failed to create HttpsProxyAgent:', e?.message || String(e));
         }
       }
 
@@ -145,8 +151,8 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     try {
       updateHFConfig(hfToken);
       reply.send({ message: 'Settings updated successfully' });
-    } catch (error) {
-      console.error('Error updating settings', error);
+    } catch (error: any) {
+      console.error('Error updating settings:', sanitizeErrorForLogging(error));
       reply.code(500).send({ error: error.name, message: error.message });
     }
   });
@@ -175,8 +181,8 @@ export default async (fastify: FastifyInstance): Promise<void> => {
           accessTokenDisplayName: response.data.auth.accessToken.displayName,
         });
       }
-    } catch (error) {
-      console.log(error);
+    } catch (error: any) {
+      console.error('HuggingFace connection test failed:', sanitizeErrorForLogging(error));
       reply.code(500).send({
         error: error.response?.data?.error || 'Hugging Face API error',
         message: error.response?.data?.error || 'Error testing Hugging Face connection',
@@ -197,9 +203,31 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     const { maxConcurrentTransfers } = req.body as any;
     try {
       updateMaxConcurrentTransfers(maxConcurrentTransfers);
+      // Update the transfer queue concurrency limit immediately
+      updateTransferQueueConcurrency(maxConcurrentTransfers);
       reply.send({ message: 'Settings updated successfully' });
-    } catch (error) {
-      console.error('Error updating settings', error);
+    } catch (error: any) {
+      console.error('Error updating settings:', sanitizeErrorForLogging(error));
+      reply.code(500).send({ error: error.name, message: error.message });
+    }
+  });
+
+  // Retrieve max files per page
+  fastify.get('/max-files-per-page', async (req: FastifyRequest, reply: FastifyReply) => {
+    logAccess(req);
+    const maxFilesPerPage = getMaxFilesPerPage();
+    reply.send({ maxFilesPerPage });
+  });
+
+  // Update max files per page
+  fastify.put('/max-files-per-page', async (req: FastifyRequest, reply: FastifyReply) => {
+    logAccess(req);
+    const { maxFilesPerPage } = req.body as any;
+    try {
+      updateMaxFilesPerPage(maxFilesPerPage);
+      reply.send({ message: 'Settings updated successfully' });
+    } catch (error: any) {
+      console.error('Error updating settings:', sanitizeErrorForLogging(error));
       reply.code(500).send({ error: error.name, message: error.message });
     }
   });
@@ -274,8 +302,8 @@ export default async (fastify: FastifyInstance): Promise<void> => {
           .code(response.status)
           .send({ message: `Connection failed with status: ${response.status}` });
       }
-    } catch (error) {
-      console.error('Error testing proxy connection:', error);
+    } catch (error: any) {
+      console.error('Error testing proxy connection:', sanitizeErrorForLogging(error));
       const err = error as Error;
 
       // Check for response field first (more specific)

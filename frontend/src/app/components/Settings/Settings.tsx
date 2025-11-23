@@ -1,13 +1,12 @@
 import HfLogo from '@app/assets/bgimages/hf-logo.svg';
 import config from '@app/config';
-import { faBucket, faNetworkWired } from '@fortawesome/free-solid-svg-icons';
-import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { Button, Content, ContentVariants, Flex, FlexItem, Form, FormGroup, PageSection, Slider, SliderOnChangeEvent, Tab, Tabs, TabTitleIcon, TabTitleText, TextInput, TextInputGroup, TextInputGroupMain, TextInputGroupUtilities } from '@patternfly/react-core';
-import { EyeIcon } from '@patternfly/react-icons';
+import { DatabaseIcon, EyeIcon, GlobeIcon } from '@patternfly/react-icons';
 import axios from 'axios';
 import * as React from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import Emitter from '../../utils/emitter';
+import { storageService } from '../../services/storageService';
 
 interface SettingsProps { }
 
@@ -97,6 +96,12 @@ const SettingsManagement: React.FunctionComponent<SettingsProps> = () => {
             .then((response) => {
                 Emitter.emit('notification', { variant: 'success', title: '', description: 'Settings saved successfully!' });
                 setS3SettingsChanged(false);
+                // Refresh storage locations to reflect new S3 configuration
+                storageService.refreshLocations()
+                    .catch((error) => {
+                        console.error('Failed to refresh storage locations after S3 config update:', error);
+                        // Don't show error notification - settings were saved successfully
+                    });
             })
             .catch((error) => {
                 console.error(error);
@@ -172,6 +177,7 @@ const SettingsManagement: React.FunctionComponent<SettingsProps> = () => {
     /* Max Concurrent Transfers Management */
 
     const [maxConcurrentTransfers, setMaxConcurrentTransfers] = React.useState<number>(0);
+    const [maxFilesPerPage, setMaxFilesPerPage] = React.useState<number>(100);
 
     React.useEffect(() => {
         axios.get(`${config.backend_api_url}/settings/max-concurrent-transfers`)
@@ -187,9 +193,35 @@ const SettingsManagement: React.FunctionComponent<SettingsProps> = () => {
             });
     }, []);
 
+    React.useEffect(() => {
+        axios.get(`${config.backend_api_url}/settings/max-files-per-page`)
+            .then((response) => {
+                const { maxFilesPerPage } = response.data;
+                if (maxFilesPerPage !== undefined) {
+                    setMaxFilesPerPage(maxFilesPerPage);
+                }
+            })
+            .catch((error) => {
+                console.error(error);
+                Emitter.emit('error', `Failed to fetch Max Files Per Page settings: ${error.response?.data?.error ? `${error.response.data.error} - ` : ''}${error.response?.data?.message || 'Server error'}`);
+            });
+    }, []);
+
     const handleSaveMaxConcurrentTransfers = (event) => {
         event.preventDefault();
         axios.put(`${config.backend_api_url}/settings/max-concurrent-transfers`, { maxConcurrentTransfers })
+            .then((response) => {
+                Emitter.emit('notification', { variant: 'success', title: '', description: 'Settings saved successfully!' });
+            })
+            .catch((error) => {
+                console.error(error);
+                Emitter.emit('notification', { variant: 'warning', title: error.response?.data?.error || 'Save Failed', description: error.response?.data?.message || 'An unknown error occurred' });
+            });
+    };
+
+    const handleSaveMaxFilesPerPage = (event) => {
+        event.preventDefault();
+        axios.put(`${config.backend_api_url}/settings/max-files-per-page`, { maxFilesPerPage })
             .then((response) => {
                 Emitter.emit('notification', { variant: 'success', title: '', description: 'Settings saved successfully!' });
             })
@@ -280,7 +312,7 @@ const SettingsManagement: React.FunctionComponent<SettingsProps> = () => {
                         title={
                             <>
                                 <TabTitleIcon>
-                                    <FontAwesomeIcon icon={faBucket} />
+                                    <DatabaseIcon />
                                 </TabTitleIcon>{' '}
                                 <TabTitleText>S3 Settings</TabTitleText>{' '}
                             </>
@@ -397,7 +429,7 @@ const SettingsManagement: React.FunctionComponent<SettingsProps> = () => {
                         title={
                             <>
                                 <TabTitleIcon>
-                                    <FontAwesomeIcon icon={faBucket} />
+                                    <DatabaseIcon />
                                 </TabTitleIcon>{' '}
                                 <TabTitleText>Max Concurrent Transfers</TabTitleText>{' '}
                             </>
@@ -422,7 +454,33 @@ const SettingsManagement: React.FunctionComponent<SettingsProps> = () => {
                         title={
                             <>
                                 <TabTitleIcon>
-                                    <FontAwesomeIcon icon={faNetworkWired} />
+                                    <DatabaseIcon />
+                                </TabTitleIcon>{' '}
+                                <TabTitleText>Max Files Per Page</TabTitleText>{' '}
+                            </>
+                        }
+                        aria-label="Max files per page">
+                        <Form onSubmit={handleSaveMaxFilesPerPage}
+                            className='settings-form'>
+                            <FormGroup label={"Max Files Per Page: " + maxFilesPerPage} fieldId="maxFilesPerPage">
+                                <Slider
+                                    hasTooltipOverThumb={false}
+                                    value={maxFilesPerPage}
+                                    min={10}
+                                    max={1000}
+                                    step={10}
+                                    className='form-settings-slider'
+                                    onChange={(_event: SliderOnChangeEvent, value: number) => setMaxFilesPerPage(value)}
+                                />
+                            </FormGroup>
+                            <Button type="submit" className='form-settings-submit'>Save Max Files Per Page</Button>
+                        </Form>
+                    </Tab>
+                    <Tab eventKey={4}
+                        title={
+                            <>
+                                <TabTitleIcon>
+                                    <GlobeIcon />
                                 </TabTitleIcon>{' '}
                                 <TabTitleText>Proxy Settings</TabTitleText>{' '}
                             </>

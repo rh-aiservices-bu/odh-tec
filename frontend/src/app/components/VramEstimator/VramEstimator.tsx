@@ -557,7 +557,7 @@ const VramEstimator: React.FunctionComponent<VramEstimatorProps> = () => {
                         </Link>{" "}
                         and the{" "}
                         <Link
-                            href="https://github.com/opendatahub-io-contrib/odh-tec/blob/main/frontend/src/app/components/VramEstimator/_lib/index.ts"
+                            href="https://github.com/rh-aiservices-bu/odh-tec/blob/main/frontend/src/app/components/VramEstimator/_lib/index.ts"
                             rel="noreferrer"
                             target="_blank"
                         >

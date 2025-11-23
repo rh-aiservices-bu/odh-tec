@@ -5,7 +5,7 @@
     "help": {
       "header": "Information",
       "body": "Open Data Hub Tools & Extensions Companion.",
-      "footer": "Source code and documentation available at https://github.com/opendatahub-io-contrib/odh-tec"
+      "footer": "Source code and documentation available at https://github.com/rh-aiservices-bu/odh-tec"
     }
   }
 }
