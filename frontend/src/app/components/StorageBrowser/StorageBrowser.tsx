@@ -306,6 +306,13 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
     // Navigate to the new location (root path)
     setFormSelectLocation(value);
     setSearchObjectText(''); // Clear search field when switching locations
+
+    // Clear stale file/directory state to prevent showing old location's content
+    // This prevents flash of incorrect content during location switch
+    setDirectories([]);
+    setFiles([]);
+    setCurrentPath('');
+
     navigate(`/browse/${value}`);
   };
 
@@ -470,6 +477,16 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
       return;
     }
 
+    // Safety check: Prevent loading files if location doesn't match URL
+    // This prevents race conditions when switching locations
+    if (selectedLocation.id !== locationId) {
+      console.log('[StorageBrowser] Location mismatch, waiting for state sync:', {
+        selectedLocationId: selectedLocation.id,
+        urlLocationId: locationId
+      });
+      return;
+    }
+
     if (!selectedLocation.available) {
       console.warn('[StorageBrowser] Location unavailable, showing empty view');
       setDirectories([]);
@@ -499,8 +516,7 @@ const StorageBrowser: React.FC<StorageBrowserProps> = () => {
       serverSearchActive ? { q: searchObjectText, mode: searchMode } : undefined,
       abortControllerRef.current || undefined,
     );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedLocation, path]);
+  }, [selectedLocation, path, locationId]);
 
   React.useEffect(() => {
     // On short searches (<3) just local filter; if we were previously server searching, reload unfiltered list.
