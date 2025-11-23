@@ -21,6 +21,8 @@ yarn.lock
 
 coverage/
 
+.playwright-mcp
+
 .claude
 
 .serena

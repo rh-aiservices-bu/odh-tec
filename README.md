@@ -56,20 +56,45 @@ The application provides a unified interface for managing both S3-compatible obj
 
 ## Screenshots
 
-Bucket Management:
-![bucket-management](img/bucket-management.png)
+The application provides powerful storage management and GPU tools for Open Data Hub users:
 
-Single File Upload to S3:
-![upload-single](img/upload-single.png)
+**Storage Management - Unified View:**
 
-Multiple File Uploads to S3:
-![multiple-upload](img/multiple-upload.png)
+![Storage Management](img/storage-management.png)
 
-Model Import from HuggingFace:
-![import-hf](img/import-hf.png)
+*Manage both S3 buckets and PVC storage from a unified interface*
 
-VRAM Estimator:
-![vram-estimator](img/vram-estimator.png)
+**HuggingFace Model Import:**
+
+![HuggingFace Import](img/storage-browse-hf-import-progress.png)
+
+*Stream models directly from HuggingFace to S3 or PVC storage with real-time progress tracking*
+
+**File Preview:**
+
+![File Preview](img/storage-browse-file-preview.png)
+
+*Preview files directly in the browser without downloading*
+
+**Cross-Storage Transfers:**
+
+![Transfer Dialog](img/storage-browse-transfer-dialog.png)
+
+*Transfer files and folders between S3 and PVC storage seamlessly*
+
+**VRAM Estimator:**
+
+![VRAM Estimator](img/vram-estimator.png)
+
+*Calculate GPU memory requirements for model inference and training*
+
+**Settings:**
+
+![S3 Settings](img/settings-s3.png)
+
+*Configure S3, HuggingFace, and other application settings*
+
+For detailed usage instructions and workflows, see [Usage Guide](docs/usage.md).
 
 ## Deployment
 
