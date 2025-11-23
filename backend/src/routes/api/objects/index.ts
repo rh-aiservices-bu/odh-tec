@@ -596,36 +596,68 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     const { bucketName, encodedKey } = req.params as any;
     const objectName = base64Decode(encodedKey); // This can also be the prefix
 
-    // Check if the objectName is a real object or a prefix
-    const listCommand = new ListObjectsV2Command({
-      Bucket: bucketName,
-      Prefix: objectName,
-    });
-
     try {
-      const listResponse = await s3Client.send(listCommand);
+      // Collect all objects to delete with pagination support
+      const objectsToDelete: { Key: string }[] = [];
+      let continuationToken: string | undefined;
 
-      if (listResponse.Contents && listResponse.Contents.length > 0) {
-        // If there are multiple objects with the prefix, delete all of them
-        const deleteParams = {
+      // Paginate through all objects with the given prefix
+      do {
+        const listCommand = new ListObjectsV2Command({
           Bucket: bucketName,
-          Delete: {
-            Objects: listResponse.Contents.map((item: any) => ({ Key: item.Key })),
-          },
-        };
+          Prefix: objectName,
+          ContinuationToken: continuationToken,
+          MaxKeys: 1000, // S3 maximum per request
+        });
 
-        const deleteCommand = new DeleteObjectsCommand(deleteParams);
-        await s3Client.send(deleteCommand);
-        reply.send({ message: 'Objects deleted successfully' });
-      } else {
-        // If it's a single object, delete it
+        const listResponse = await s3Client.send(listCommand);
+
+        if (listResponse.Contents && listResponse.Contents.length > 0) {
+          objectsToDelete.push(...listResponse.Contents.map((item: any) => ({ Key: item.Key })));
+        }
+
+        continuationToken = listResponse.NextContinuationToken;
+      } while (continuationToken);
+
+      // If no objects found, try deleting as a single object
+      if (objectsToDelete.length === 0) {
         const deleteCommand = new DeleteObjectCommand({
           Bucket: bucketName,
           Key: objectName,
         });
         await s3Client.send(deleteCommand);
         reply.send({ message: 'Object deleted successfully' });
+        return;
       }
+
+      // Delete objects in batches of 1000 (S3 limit for bulk delete)
+      const batchSize = 1000;
+      let totalDeleted = 0;
+
+      for (let i = 0; i < objectsToDelete.length; i += batchSize) {
+        const batch = objectsToDelete.slice(i, i + batchSize);
+
+        const deleteCommand = new DeleteObjectsCommand({
+          Bucket: bucketName,
+          Delete: {
+            Objects: batch,
+            Quiet: true, // Don't return deleted object details (reduces response size)
+          },
+        });
+
+        const deleteResponse = await s3Client.send(deleteCommand);
+        totalDeleted += batch.length;
+
+        // Log any errors (even in Quiet mode, errors are still returned)
+        if (deleteResponse.Errors && deleteResponse.Errors.length > 0) {
+          console.error(`[Delete] Batch ${i / batchSize + 1} had errors:`, deleteResponse.Errors);
+        }
+      }
+
+      reply.send({
+        message: `Successfully deleted ${totalDeleted} object(s)`,
+        count: totalDeleted,
+      });
     } catch (error: any) {
       if (error instanceof S3ServiceException) {
         reply.code(error.$metadata.httpStatusCode || 500).send({

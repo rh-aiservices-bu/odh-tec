@@ -4,6 +4,8 @@ import { NodeHttpHandler } from '@aws-sdk/node-http-handler';
 import { HttpProxyAgent } from 'http-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { getApplyMd5BodyChecksumPlugin } from '@aws-sdk/middleware-apply-body-checksum';
+import http from 'http';
+import https from 'https';
 
 // Initial configuration
 let accessKeyId = process.env.AWS_ACCESS_KEY_ID || '';
@@ -44,35 +46,54 @@ export const initializeS3Client = (): S3Client => {
       accessKeyId: accessKeyId,
       secretAccessKey: secretAccessKey,
     },
+    // AWS SDK retry configuration
+    maxAttempts: 5, // Retry up to 5 times
+    retryMode: 'adaptive', // Adaptive retry mode with exponential backoff
+  };
+
+  // HTTP agent configuration for connection pooling and keep-alive
+  const agentOptions: http.AgentOptions = {
+    keepAlive: true, // Reuse TCP connections
+    keepAliveMsecs: 1000, // Send keep-alive probes every 1 second
+    maxSockets: 10, // Allow up to 10 concurrent connections
+    maxFreeSockets: 5, // Keep up to 5 idle connections
+    timeout: 30000, // 30 second socket timeout
   };
 
   const agentConfig: {
-    httpAgent?: HttpProxyAgent<string>;
-    httpsAgent?: HttpsProxyAgent<string>;
+    httpAgent?: HttpProxyAgent<string> | http.Agent;
+    httpsAgent?: HttpsProxyAgent<string> | https.Agent;
   } = {};
 
+  // Configure HTTP agent (proxy or regular)
   if (httpProxy) {
     try {
       agentConfig.httpAgent = new HttpProxyAgent<string>(httpProxy);
     } catch (e) {
       console.error('Failed to create HttpProxyAgent:', e);
     }
+  } else {
+    agentConfig.httpAgent = new http.Agent(agentOptions);
   }
 
+  // Configure HTTPS agent (proxy or regular)
   if (httpsProxy) {
     try {
       agentConfig.httpsAgent = new HttpsProxyAgent<string>(httpsProxy);
     } catch (e) {
       console.error('Failed to create HttpsProxyAgent:', e);
     }
+  } else {
+    agentConfig.httpsAgent = new https.Agent(agentOptions);
   }
 
-  if (agentConfig.httpAgent || agentConfig.httpsAgent) {
-    s3ClientOptions.requestHandler = new NodeHttpHandler({
-      ...(agentConfig.httpAgent && { httpAgent: agentConfig.httpAgent }),
-      ...(agentConfig.httpsAgent && { httpsAgent: agentConfig.httpsAgent }),
-    });
-  }
+  // Always configure request handler with connection pooling and timeouts
+  s3ClientOptions.requestHandler = new NodeHttpHandler({
+    connectionTimeout: 5000, // 5 second connection timeout
+    requestTimeout: 300000, // 5 minute request timeout (for large files)
+    httpAgent: agentConfig.httpAgent,
+    httpsAgent: agentConfig.httpsAgent,
+  });
 
   const client = new S3Client(s3ClientOptions) as NodeJsClient<S3Client>;
 

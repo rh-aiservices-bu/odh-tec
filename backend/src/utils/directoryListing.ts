@@ -1,6 +1,7 @@
 import { S3Client, ListObjectsV2Command, S3ServiceException } from '@aws-sdk/client-s3';
 import { promises as fs } from 'fs';
 import path from 'path';
+import pLimit from 'p-limit';
 
 /**
  * IMPORTANT: Path Separator Handling
@@ -69,6 +70,7 @@ export class ListingError extends Error {
  * @param s3Client - Configured S3 client
  * @param bucket - S3 bucket name
  * @param prefix - Directory prefix to list (e.g., "models/")
+ * @param limiter - Optional concurrency limiter to prevent overwhelming S3 endpoints
  * @returns Directory listing with file paths, sizes, and metadata
  * @throws S3ServiceException if S3 operation fails
  * @throws ListingError if listing operation fails
@@ -77,6 +79,7 @@ export async function listS3DirectoryRecursive(
   s3Client: S3Client,
   bucket: string,
   prefix: string,
+  limiter?: ReturnType<typeof pLimit>,
 ): Promise<DirectoryListing> {
   const files: FileInfo[] = [];
   const emptyDirectories: string[] = [];
@@ -89,14 +92,26 @@ export async function listS3DirectoryRecursive(
   try {
     // ⭐ Streaming implementation - process results incrementally
     do {
-      const response = await s3Client.send(
-        new ListObjectsV2Command({
-          Bucket: bucket,
-          Prefix: normalizedPrefix,
-          ContinuationToken: continuationToken,
-          MaxKeys: 1000, // S3 maximum - API automatically paginates
-        }),
-      );
+      // Use limiter if provided, otherwise call directly
+      const response = limiter
+        ? await limiter(() =>
+            s3Client.send(
+              new ListObjectsV2Command({
+                Bucket: bucket,
+                Prefix: normalizedPrefix,
+                ContinuationToken: continuationToken,
+                MaxKeys: 1000, // S3 maximum - API automatically paginates
+              }),
+            ),
+          )
+        : await s3Client.send(
+            new ListObjectsV2Command({
+              Bucket: bucket,
+              Prefix: normalizedPrefix,
+              ContinuationToken: continuationToken,
+              MaxKeys: 1000, // S3 maximum - API automatically paginates
+            }),
+          );
 
       // Process batch incrementally (memory efficient)
       for (const obj of response.Contents || []) {

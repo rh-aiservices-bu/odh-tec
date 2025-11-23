@@ -3,7 +3,6 @@ import { pipeline } from 'stream/promises';
 import { Transform, Readable } from 'stream';
 import { promises as fs } from 'fs';
 import path from 'path';
-import pLimit from 'p-limit';
 import {
   GetObjectCommand,
   CopyObjectCommand,
@@ -135,12 +134,10 @@ function parseTransferPath(transferPath: string): [string, string, string] {
 }
 
 /**
- * Concurrency limiter for S3 metadata operations (HeadObject, ListObjectsV2)
- * Limits concurrent metadata requests to prevent overwhelming S3 endpoints
- * Separate from file transfer concurrency (which is controlled by transferQueue)
- * Reduced to 5 to minimize connection pool contention with data transfers
+ * Note: All S3 operations (metadata and data transfers) now share the same
+ * concurrency limiter from transferQueue to prevent overwhelming S3 endpoints.
+ * This ensures total concurrent S3 operations never exceed MAX_CONCURRENT_TRANSFERS.
  */
-const metadataLimiter = pLimit(5);
 
 /**
  * Ensures a directory exists, creating it and all parent directories if needed
@@ -174,7 +171,7 @@ async function checkExists(type: string, locationId: string, filePath: string): 
         Bucket: locationId,
         Key: filePath,
       });
-      await s3Client.send(command);
+      await transferQueue.getLimiter()(() => s3Client.send(command));
       return true;
     }
     return false;
@@ -204,6 +201,81 @@ async function findNonConflictingName(
   }
 
   return testPath;
+}
+
+/**
+ * Retry helper for network operations with exponential backoff
+ * Retries network errors (ECONNREFUSED, ETIMEDOUT, ENOTFOUND, EAI_AGAIN)
+ * @param operation - Async function to retry
+ * @param operationName - Name for logging
+ * @param maxRetries - Maximum number of retries (default: 3)
+ * @param abortSignal - Optional abort signal to cancel the operation
+ * @returns Result of the operation
+ */
+async function retryNetworkOperation<T>(
+  operation: () => Promise<T>,
+  operationName: string,
+  maxRetries = 3,
+  abortSignal?: AbortSignal,
+): Promise<T> {
+  const retryableErrorCodes = ['ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET'];
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    // Check if operation was aborted before attempting
+    if (abortSignal?.aborted) {
+      const abortError = new Error('Transfer cancelled by user');
+      abortError.name = 'AbortError';
+      throw abortError;
+    }
+
+    try {
+      return await operation();
+    } catch (error: any) {
+      // Check if this is an abort error from the SDK
+      if (error.name === 'AbortError' || abortSignal?.aborted) {
+        throw error;
+      }
+
+      const isRetryable = retryableErrorCodes.includes(error.code);
+      const isLastAttempt = attempt === maxRetries;
+
+      if (!isRetryable || isLastAttempt) {
+        // Not a retryable error or exhausted retries - throw
+        throw error;
+      }
+
+      // Calculate backoff delay: 1s, 2s, 4s
+      const delayMs = 1000 * Math.pow(2, attempt);
+      console.warn(
+        `[Retry] ${operationName} failed (${error.code}), attempt ${
+          attempt + 1
+        }/${maxRetries}, retrying in ${delayMs}ms`,
+      );
+
+      // Wait before retrying, but check abort signal during delay
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(resolve, delayMs);
+
+        // If aborted during delay, cancel timeout and reject
+        if (abortSignal) {
+          const abortHandler = () => {
+            clearTimeout(timeout);
+            const abortError = new Error('Transfer cancelled by user');
+            abortError.name = 'AbortError';
+            reject(abortError);
+          };
+
+          abortSignal.addEventListener('abort', abortHandler, { once: true });
+
+          // Clean up listener when timeout completes normally
+          setTimeout(() => abortSignal.removeEventListener('abort', abortHandler), delayMs);
+        }
+      });
+    }
+  }
+
+  // Should never reach here, but TypeScript doesn't know that
+  throw new Error('Unexpected retry loop exit');
 }
 
 /**
@@ -254,8 +326,16 @@ async function transferS3ToLocal(
 
   let response;
   try {
-    const command = new GetObjectCommand({ Bucket: bucket, Key: key });
-    response = await s3Client.send(command);
+    // Wrap GetObject in retry logic for network errors
+    response = await retryNetworkOperation(
+      async () => {
+        const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+        return await s3Client.send(command, { abortSignal });
+      },
+      `GetObject: ${key}`,
+      3, // Retry up to 3 times
+      abortSignal, // Pass abort signal to retry logic
+    );
 
     const connTime = Date.now() - startTime;
     console.log(`[Transfer] GetObject CONNECTED: ${key}`, {
@@ -315,10 +395,15 @@ async function transferS3ToLocal(
     },
   });
 
-  // Add abort handling to progress transform
+  // Add abort handling to both streams
   if (abortSignal) {
     const abortHandler = () => {
-      progressTransform.destroy(new Error('Transfer cancelled'));
+      const abortError = new Error('Transfer cancelled');
+      // Destroy both the source stream and transform stream
+      if (response.Body && typeof (response.Body as any).destroy === 'function') {
+        (response.Body as any).destroy(abortError);
+      }
+      progressTransform.destroy(abortError);
     };
     abortSignal.addEventListener('abort', abortHandler);
     progressTransform.on('close', () => {
@@ -478,10 +563,21 @@ async function transferLocalToLocal(
     },
   });
 
-  // Add abort handling to progress transform
+  // Memory profiling: Before pipeline
+  logMemory(`[Local→Local] Before pipeline: ${fileName}`);
+
+  const { createReadStream, createWriteStream } = await import('fs');
+  const readStream = createReadStream(sourceAbsolute);
+  const writeStream = createWriteStream(destAbsolute);
+
+  // Add abort handling to all streams
   if (abortSignal) {
     const abortHandler = () => {
-      progressTransform.destroy(new Error('Transfer cancelled'));
+      const abortError = new Error('Transfer cancelled');
+      // Destroy all streams in the pipeline
+      readStream.destroy(abortError);
+      progressTransform.destroy(abortError);
+      writeStream.destroy(abortError);
     };
     abortSignal.addEventListener('abort', abortHandler);
     progressTransform.on('close', () => {
@@ -489,15 +585,7 @@ async function transferLocalToLocal(
     });
   }
 
-  // Memory profiling: Before pipeline
-  logMemory(`[Local→Local] Before pipeline: ${fileName}`);
-
-  const { createReadStream, createWriteStream } = await import('fs');
-  await pipeline(
-    createReadStream(sourceAbsolute),
-    progressTransform,
-    createWriteStream(destAbsolute),
-  );
+  await pipeline(readStream, progressTransform, writeStream);
 
   // Memory profiling: Transfer complete
   logMemory(`[Local→Local] Complete: ${fileName}`);
@@ -532,7 +620,7 @@ async function transferS3ToS3(
     Bucket: sourceBucket,
     Key: sourceKey,
   });
-  const headResponse = await metadataLimiter(() => s3Client.send(headCommand));
+  const headResponse = await transferQueue.getLimiter()(() => s3Client.send(headCommand));
   fileJob.size = headResponse.ContentLength || 0;
 
   // Memory profiling: File size obtained
@@ -648,7 +736,7 @@ async function expandItemsToFiles(
           console.log(`[Metadata] HeadObject START: ${key}`);
 
           // Limit concurrent HEAD requests to prevent overwhelming S3 endpoint
-          const response = await metadataLimiter(() =>
+          const response = await transferQueue.getLimiter()(() =>
             s3Client.send(
               new HeadObjectCommand({
                 Bucket: source.locationId,
@@ -725,7 +813,12 @@ async function expandItemsToFiles(
         const prefix = source.path ? path.posix.join(source.path, item.path) : item.path;
 
         try {
-          dirListing = await listS3DirectoryRecursive(s3Client, source.locationId, prefix);
+          dirListing = await listS3DirectoryRecursive(
+            s3Client,
+            source.locationId,
+            prefix,
+            transferQueue.getLimiter(),
+          );
         } catch (error: any) {
           if (error instanceof S3ServiceException) {
             const statusCode = error.$metadata?.httpStatusCode || 500;
@@ -861,12 +954,14 @@ async function listDestinationFiles(
       : '';
 
     do {
-      const response = await s3Client.send(
-        new ListObjectsV2Command({
-          Bucket: destination.locationId,
-          Prefix: prefix,
-          ContinuationToken: continuationToken,
-        }),
+      const response = await transferQueue.getLimiter()(() =>
+        s3Client.send(
+          new ListObjectsV2Command({
+            Bucket: destination.locationId,
+            Prefix: prefix,
+            ContinuationToken: continuationToken,
+          }),
+        ),
       );
 
       for (const obj of response.Contents || []) {
@@ -1310,8 +1405,8 @@ export default async (fastify: FastifyInstance): Promise<void> => {
           await deleteFile(type, locationId, filePath);
         } catch (error: any) {
           fastify.log.error(
-            `Failed to delete file ${file.destinationPath}:`,
             sanitizeErrorForLogging(error),
+            `Failed to delete file ${file.destinationPath}:`,
           );
           errors.push(`${file.destinationPath}: ${error.message}`);
         }

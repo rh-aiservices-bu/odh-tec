@@ -1,6 +1,5 @@
 import { fastify } from 'fastify';
 import fastifyMultipart from '@fastify/multipart';
-import pino from 'pino';
 import { APP_ENV, PORT, IP, LOG_LEVEL } from './utils/constants';
 import { initializeApp } from './app';
 import { AddressInfo } from 'net';
@@ -12,28 +11,23 @@ import { getCorsConfig } from './config/cors';
 import { getLocalStoragePaths } from './utils/config';
 import { getStorageLocations } from './utils/localStorage';
 
-const transport =
-  APP_ENV === 'development'
-    ? pino.transport({
+const app = fastify({
+  logger: {
+    level: LOG_LEVEL,
+    redact: [
+      'err.response.request.headers.Authorization',
+      'response.request.headers.Authorization',
+      'request.headers.Authorization',
+      'headers.Authorization',
+      'Authorization',
+    ],
+    ...(APP_ENV === 'development' && {
+      transport: {
         target: 'pino-pretty',
         options: { colorize: true },
-      })
-    : undefined;
-
-const app = fastify({
-  logger: pino(
-    {
-      level: LOG_LEVEL,
-      redact: [
-        'err.response.request.headers.Authorization',
-        'response.request.headers.Authorization',
-        'request.headers.Authorization',
-        'headers.Authorization',
-        'Authorization',
-      ],
-    },
-    transport,
-  ),
+      },
+    }),
+  },
   pluginTimeout: 10000,
   maxParamLength: 1000,
 });

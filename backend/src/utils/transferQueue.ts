@@ -369,6 +369,14 @@ export class TransferQueue extends EventEmitter {
   updateConcurrencyLimit(newLimit: number): void {
     this.limiter = pLimit(newLimit);
   }
+
+  /**
+   * Get the p-limit limiter for controlling concurrency
+   * Allows other code to use the same concurrency limit for S3 operations
+   */
+  getLimiter(): ReturnType<typeof pLimit> {
+    return this.limiter;
+  }
 }
 
 /**
