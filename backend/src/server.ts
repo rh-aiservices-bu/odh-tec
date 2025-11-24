@@ -1,6 +1,6 @@
 import { fastify } from 'fastify';
 import fastifyMultipart from '@fastify/multipart';
-import { APP_ENV, PORT, IP, LOG_LEVEL } from './utils/constants';
+import { APP_ENV, PORT, IP, LOG_LEVEL, LOG_HEALTH_CHECKS } from './utils/constants';
 import { initializeApp } from './app';
 import { AddressInfo } from 'net';
 import https from 'https';
@@ -28,8 +28,57 @@ const app = fastify({
       },
     }),
   },
+  disableRequestLogging: true, // Disable default logging so we can filter health checks
   pluginTimeout: 10000,
   maxParamLength: 1000,
+});
+
+// Helper to check if request is a health check probe or idle culler request
+const isHealthCheckRequest = (url: string | undefined, method: string): boolean => {
+  if (method !== 'GET' || !url) {
+    return false;
+  }
+  // OpenShift liveness/readiness probes
+  if (url.endsWith('/api')) {
+    return true;
+  }
+  // Idle culler mechanism endpoints
+  if (url.endsWith('/api/kernels') || url.endsWith('/api/terminals')) {
+    return true;
+  }
+  return false;
+};
+
+// Custom request logging hook - filters out health check requests
+app.addHook('onRequest', (request, _reply, done) => {
+  const isHealthCheck = isHealthCheckRequest(request.url, request.method);
+  if (!isHealthCheck || LOG_HEALTH_CHECKS) {
+    request.log.info(
+      {
+        method: request.method,
+        url: request.url,
+        hostname: request.hostname,
+        remoteAddress: request.ip,
+      },
+      'incoming request',
+    );
+  }
+  done();
+});
+
+// Custom response logging hook - filters out health check requests
+app.addHook('onResponse', (request, reply, done) => {
+  const isHealthCheck = isHealthCheckRequest(request.url, request.method);
+  if (!isHealthCheck || LOG_HEALTH_CHECKS) {
+    request.log.info(
+      {
+        statusCode: reply.statusCode,
+        responseTime: reply.elapsedTime,
+      },
+      'request completed',
+    );
+  }
+  done();
 });
 
 // Register CORS with secure configuration

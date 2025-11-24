@@ -79,15 +79,17 @@ export type TransferExecutor = (
  */
 export class TransferQueue extends EventEmitter {
   private limiter: ReturnType<typeof pLimit>;
+  private metadataLimiter: ReturnType<typeof pLimit>; // Separate limiter for metadata ops to avoid deadlock
   private jobs: Map<string, TransferJob>;
   private activeTransfers: Set<string>;
   private nextJobId: number;
   private lastEmitTime: Map<string, number>; // Track last emit time per job for throttling
-  private memoryMonitoringTimers: Map<string, NodeJS.Timeout>; // Track periodic memory logging timers
+  private memoryMonitoringTimers: Map<string, NodeJS.Timeout | null>; // Track periodic memory logging timers (null if profiler disabled)
 
   constructor(concurrencyLimit: number) {
     super();
     this.limiter = pLimit(concurrencyLimit);
+    this.metadataLimiter = pLimit(20); // Higher concurrency for lightweight metadata ops (HeadObject, ListObjects)
     this.jobs = new Map();
     this.activeTransfers = new Set();
     this.nextJobId = 1;
@@ -235,13 +237,13 @@ export class TransferQueue extends EventEmitter {
     if (!job) return;
 
     // Start periodic memory monitoring for this job
-    const memoryTimer = startPeriodicLogging(5000, `[Transfer ${jobId}]`);
+    const memoryTimer = startPeriodicLogging(5000, `Transfer ${jobId}`);
     this.memoryMonitoringTimers.set(jobId, memoryTimer);
-    logMemory(`[Transfer ${jobId}] Job started - ${job.files.length} files queued`);
+    logMemory(`Transfer ${jobId} - Job started - ${job.files.length} files queued`);
 
     // Process each file with concurrency limit
-    const promises = job.files.map((file) =>
-      this.limiter(async () => {
+    const promises = job.files.map((file) => {
+      return this.limiter(async () => {
         // Check if job was cancelled or aborted before starting
         if (job.status === 'cancelled' || job.abortController.signal.aborted) {
           file.status = 'error';
@@ -260,7 +262,7 @@ export class TransferQueue extends EventEmitter {
               file.loaded = loaded;
               this.updateJob(jobId);
             },
-            job.abortController.signal, // Pass abort signal to executor
+            job.abortController.signal,
           );
 
           file.status = 'completed';
@@ -276,8 +278,8 @@ export class TransferQueue extends EventEmitter {
         }
 
         this.updateJob(jobId);
-      }),
-    );
+      });
+    });
 
     await Promise.all(promises);
 
@@ -287,7 +289,7 @@ export class TransferQueue extends EventEmitter {
       stopPeriodicLogging(timer);
       this.memoryMonitoringTimers.delete(jobId);
     }
-    logMemory(`[Transfer ${jobId}] Job finished`);
+    logMemory(`Transfer ${jobId} - Job finished`);
   }
 
   /**
@@ -376,6 +378,16 @@ export class TransferQueue extends EventEmitter {
    */
   getLimiter(): ReturnType<typeof pLimit> {
     return this.limiter;
+  }
+
+  /**
+   * Get the metadata limiter for lightweight S3 operations (HeadObject, ListObjects)
+   * Uses higher concurrency since these don't consume significant memory.
+   * IMPORTANT: Use this for metadata ops inside transfer executors to avoid deadlock
+   * with the main transfer limiter.
+   */
+  getMetadataLimiter(): ReturnType<typeof pLimit> {
+    return this.metadataLimiter;
   }
 }
 

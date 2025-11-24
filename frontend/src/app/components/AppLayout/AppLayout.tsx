@@ -512,7 +512,7 @@ const AppLayout: React.FunctionComponent<IAppLayout> = ({ children }) => {
               red.ht/cai team
             </a>
             <br />
-            version 2.1.0
+            version 2.1.1
             <br />
             <Flex direction={{ default: 'column' }} style={{ width: '100%', alignItems: 'center' }}>
               <FlexItem style={{ marginBottom: '0rem' }}>

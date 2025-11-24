@@ -171,7 +171,8 @@ async function checkExists(type: string, locationId: string, filePath: string): 
         Bucket: locationId,
         Key: filePath,
       });
-      await transferQueue.getLimiter()(() => s3Client.send(command));
+
+      await transferQueue.getMetadataLimiter()(() => s3Client.send(command));
       return true;
     }
     return false;
@@ -318,12 +319,6 @@ async function transferS3ToLocal(
   // NOW validate the full path (parent exists, so validation succeeds)
   const absolutePath = await validatePath(locationId, destPath);
 
-  // Log data transfer operation start
-  const startTime = Date.now();
-  console.log(`[Transfer] GetObject START: ${key}`, {
-    dest: destPath,
-  });
-
   let response;
   try {
     // Wrap GetObject in retry logic for network errors
@@ -336,27 +331,7 @@ async function transferS3ToLocal(
       3, // Retry up to 3 times
       abortSignal, // Pass abort signal to retry logic
     );
-
-    const connTime = Date.now() - startTime;
-    console.log(`[Transfer] GetObject CONNECTED: ${key}`, {
-      connectionTime: `${connTime}ms`,
-    });
   } catch (error: any) {
-    const duration = Date.now() - startTime;
-
-    // Extract only safe error properties - avoid logging full error object
-    // which may contain $response, $metadata, or other properties with socket/agent references
-    const safeError = {
-      duration: `${duration}ms`,
-      message: error.message || String(error),
-      code: error.code,
-      name: error.name,
-      statusCode: error.$metadata?.httpStatusCode,
-      requestId: error.$metadata?.requestId,
-      stack: error.stack?.split('\n').slice(0, 3).join('\n'), // First 3 lines of stack
-    };
-
-    console.error(`[Transfer] GetObject FAILED: ${key}`, safeError);
     // Throw a sanitized error without AWS SDK internals (socket/agent references with certificates)
     throw sanitizeError(error);
   }
@@ -463,9 +438,9 @@ async function transferLocalToS3(
   // Get file size
   const stats = await fs.stat(absolutePath);
   fileJob.size = stats.size;
+  const sizeInMB = (fileJob.size / (1024 * 1024)).toFixed(2);
 
   // Memory profiling: File size obtained
-  const sizeInMB = (fileJob.size / (1024 * 1024)).toFixed(2);
   logMemory(`[Local→S3] File size: ${fileName} (${sizeInMB} MB)`);
 
   const { createReadStream } = await import('fs');
@@ -620,7 +595,7 @@ async function transferS3ToS3(
     Bucket: sourceBucket,
     Key: sourceKey,
   });
-  const headResponse = await transferQueue.getLimiter()(() => s3Client.send(headCommand));
+  const headResponse = await transferQueue.getMetadataLimiter()(() => s3Client.send(headCommand));
   fileJob.size = headResponse.ContentLength || 0;
 
   // Memory profiling: File size obtained
@@ -670,7 +645,6 @@ async function executeTransfer(
   } else if (conflictResolution === 'rename') {
     finalDestPath = await findNonConflictingName(destType, destLoc, destPath);
   }
-  // 'overwrite' - just proceed with original path
 
   // Execute transfer based on source/destination types
   if (sourceType === 's3' && destType === 'local') {
@@ -720,47 +694,32 @@ async function expandItemsToFiles(
 ): Promise<FileInfo[]> {
   const allFiles: FileInfo[] = [];
 
-  for (const item of items) {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+
     if (item.type === 'file') {
       // Individual file - get size upfront for accurate progress tracking
       let size = 0;
 
       if (source.type === 's3') {
         const { s3Client } = getS3Config();
+
         // S3 always uses forward slashes (POSIX paths) regardless of OS
         const key = source.path ? path.posix.join(source.path, item.path) : item.path;
 
         try {
-          // Log metadata operation start
-          const startTime = Date.now();
-          console.log(`[Metadata] HeadObject START: ${key}`);
-
           // Limit concurrent HEAD requests to prevent overwhelming S3 endpoint
-          const response = await transferQueue.getLimiter()(() =>
-            s3Client.send(
+          const response = await transferQueue.getMetadataLimiter()(async () => {
+            return await s3Client.send(
               new HeadObjectCommand({
                 Bucket: source.locationId,
                 Key: key,
               }),
-            ),
-          );
+            );
+          });
+
           size = response.ContentLength || 0;
-
-          // Log successful completion
-          const duration = Date.now() - startTime;
-          console.log(`[Metadata] HeadObject SUCCESS: ${key}`, {
-            duration: `${duration}ms`,
-            size: `${(size / 1024 / 1024).toFixed(2)}MB`,
-          });
         } catch (error: any) {
-          // Log error
-          const duration = Date.now() - (error.startTime || Date.now());
-          console.error(`[Metadata] HeadObject FAILED: ${key}`, {
-            duration: `${duration}ms`,
-            error: error.message,
-            code: error.code,
-          });
-
           if (error instanceof S3ServiceException) {
             const statusCode = error.$metadata?.httpStatusCode || 500;
             if (error.name === 'NotFound' || error.name === 'NoSuchKey' || statusCode === 404) {
@@ -784,6 +743,7 @@ async function expandItemsToFiles(
 
         try {
           const stats = await fs.stat(fullPath);
+
           if (!stats.isFile()) {
             throw new Error(`Path is not a file: ${item.path}`);
           }
@@ -817,7 +777,7 @@ async function expandItemsToFiles(
             s3Client,
             source.locationId,
             prefix,
-            transferQueue.getLimiter(),
+            transferQueue.getMetadataLimiter(),
           );
         } catch (error: any) {
           if (error instanceof S3ServiceException) {
@@ -941,6 +901,7 @@ async function listDestinationFiles(
   destination: ConflictCheckRequest['destination'],
 ): Promise<string[]> {
   const { s3Client } = getS3Config();
+
   let files: string[] = [];
 
   if (destination.type === 's3') {
@@ -954,15 +915,15 @@ async function listDestinationFiles(
       : '';
 
     do {
-      const response = await transferQueue.getLimiter()(() =>
-        s3Client.send(
+      const response = await transferQueue.getMetadataLimiter()(async () => {
+        return await s3Client.send(
           new ListObjectsV2Command({
             Bucket: destination.locationId,
             Prefix: prefix,
             ContinuationToken: continuationToken,
           }),
-        ),
-      );
+        );
+      });
 
       for (const obj of response.Contents || []) {
         // Remove prefix to get relative path
@@ -981,6 +942,7 @@ async function listDestinationFiles(
     // Check if destination directory exists
     try {
       const stats = await fs.stat(fullPath);
+
       if (!stats.isDirectory()) {
         // Destination is a file, not a directory - no conflicts
         return [];
@@ -996,6 +958,7 @@ async function listDestinationFiles(
     // List all files recursively
     const basePath = await validatePath(destination.locationId, '');
     const listing = await listLocalDirectoryRecursive(basePath, destination.path);
+
     files = listing.files.map((f) => f.path);
 
     // Remove source.path prefix to get relative paths
@@ -1074,7 +1037,13 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     const body = request.body as any;
 
     // For transfer POST requests, check both source and destination
-    if (request.method === 'POST' && request.url === '/' && body.source && body.destination) {
+    const isTransferRoute =
+      request.method === 'POST' &&
+      request.routeOptions.url === '/' &&
+      body.source &&
+      body.destination;
+
+    if (isTransferRoute) {
       try {
         // Check source location access
         if (body.source.type === 'local') {
@@ -1095,7 +1064,12 @@ export default async (fastify: FastifyInstance): Promise<void> => {
     }
 
     // For conflict check requests, check destination
-    if (request.method === 'POST' && request.url === '/check-conflicts' && body.destination) {
+    const isConflictCheckRoute =
+      request.method === 'POST' &&
+      request.routeOptions.url === '/check-conflicts' &&
+      body.destination;
+
+    if (isConflictCheckRoute) {
       try {
         if (body.destination.type === 'local') {
           authorizeLocation(request.user, body.destination.locationId);
@@ -1114,7 +1088,7 @@ export default async (fastify: FastifyInstance): Promise<void> => {
   /**
    * Audit logging hook - logs all requests after completion
    */
-  fastify.addHook('onResponse', async (request: FastifyRequest, reply: FastifyReply) => {
+  fastify.addHook('onResponse', (request: FastifyRequest, reply: FastifyReply) => {
     if (request.user) {
       const body = request.body as any;
       let resource = 'transfer:unknown';

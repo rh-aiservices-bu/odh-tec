@@ -17,6 +17,9 @@ import {
   DescriptionListGroup,
   DescriptionListTerm,
   Modal,
+  ModalBody,
+  ModalFooter,
+  ModalHeader,
 } from '@patternfly/react-core';
 import Emitter from '@app/utils/emitter';
 import config from '@app/config';
@@ -281,23 +284,24 @@ const handleProceedWithTransfer = async () => {
 
       {showLargeFolderWarning && largeFolderWarningData && (
         <Modal
+          className="standard-modal"
           variant="small"
-          title="Large Folder Transfer"
           isOpen={showLargeFolderWarning}
           onClose={() => {
             setShowLargeFolderWarning(false);
             setLargeFolderWarningData(null);
           }}
         >
-          <div>
+          <ModalHeader title="Large Folder Transfer" />
+          <ModalBody>
             <Alert
               variant="warning"
               isInline
               title="Large transfer operation"
+              style={{ marginBottom: '1rem' }}
             >
               <p>{largeFolderWarningData.message}</p>
             </Alert>
-            <br />
             <DescriptionList isHorizontal>
               <DescriptionListGroup>
                 <DescriptionListTerm>Files to transfer</DescriptionListTerm>
@@ -312,13 +316,18 @@ const handleProceedWithTransfer = async () => {
                 </DescriptionListDescription>
               </DescriptionListGroup>
             </DescriptionList>
-            <br />
-            <small>
+            <p style={{ marginTop: '1rem', fontSize: '0.875rem', color: 'var(--pf-t--global--text--color--subtle)' }}>
               This operation may take significant time to complete. You can monitor
               progress in the transfer queue.
-            </small>
-          </div>
-          <div className="pf-c-modal-box__footer">
+            </p>
+          </ModalBody>
+          <ModalFooter>
+            <Button
+              variant="primary"
+              onClick={handleProceedWithTransfer}
+            >
+              Proceed
+            </Button>
             <Button
               variant="link"
               onClick={() => {
@@ -328,13 +337,7 @@ const handleProceedWithTransfer = async () => {
             >
               Cancel
             </Button>
-            <Button
-              variant="primary"
-              onClick={handleProceedWithTransfer}
-            >
-              Proceed
-            </Button>
-          </div>
+          </ModalFooter>
         </Modal>
       )}
     </>

@@ -3,7 +3,12 @@
  *
  * Provides tools to track and log memory usage during transfers.
  * Helps identify memory leaks and performance bottlenecks.
+ *
+ * Memory profiling is disabled by default and can be enabled by setting
+ * the ENABLE_MEMORY_PROFILER environment variable to 'true'.
  */
+
+import { ENABLE_MEMORY_PROFILER } from './constants';
 
 export interface MemorySnapshot {
   timestamp: number;
@@ -46,9 +51,21 @@ function captureSnapshot(): MemorySnapshot {
  * Log memory usage with optional label and delta calculation
  *
  * @param label - Descriptive label for this checkpoint
- * @returns Current memory snapshot
+ * @returns Current memory snapshot (or dummy snapshot if profiler disabled)
  */
 export function logMemory(label: string): MemorySnapshot {
+  // Early return if memory profiler is disabled
+  if (!ENABLE_MEMORY_PROFILER) {
+    return {
+      timestamp: Date.now(),
+      rss: 0,
+      heapTotal: 0,
+      heapUsed: 0,
+      external: 0,
+      arrayBuffers: 0,
+    };
+  }
+
   const snapshot = captureSnapshot();
 
   // Calculate deltas if we have a previous snapshot
@@ -80,9 +97,14 @@ export function logMemory(label: string): MemorySnapshot {
  *
  * @param intervalMs - Logging interval in milliseconds (default: 5000ms)
  * @param label - Optional label prefix for logs
- * @returns Timer handle (use with stopPeriodicLogging)
+ * @returns Timer handle (use with stopPeriodicLogging), or null if profiler disabled
  */
-export function startPeriodicLogging(intervalMs = 5000, label = 'Periodic'): NodeJS.Timeout {
+export function startPeriodicLogging(intervalMs = 5000, label = 'Periodic'): NodeJS.Timeout | null {
+  // Return null if memory profiler is disabled
+  if (!ENABLE_MEMORY_PROFILER) {
+    return null;
+  }
+
   console.log(`[Memory] Starting periodic logging every ${intervalMs}ms`);
   return setInterval(() => {
     logMemory(label);
@@ -92,9 +114,14 @@ export function startPeriodicLogging(intervalMs = 5000, label = 'Periodic'): Nod
 /**
  * Stop periodic memory logging
  *
- * @param timer - Timer handle from startPeriodicLogging
+ * @param timer - Timer handle from startPeriodicLogging (can be null if profiler was disabled)
  */
-export function stopPeriodicLogging(timer: NodeJS.Timeout): void {
+export function stopPeriodicLogging(timer: NodeJS.Timeout | null): void {
+  if (!timer) {
+    // Timer was null because profiler was disabled - nothing to stop
+    return;
+  }
+
   clearInterval(timer);
   console.log('[Memory] Stopped periodic logging');
 }
